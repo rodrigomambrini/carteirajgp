@@ -22,13 +22,42 @@ métricas e análise recalculam ao vivo no navegador.
 
 Sem backend e sem chave de API. `scripts/fetch_and_compute.py` roda no GitHub
 Actions a cada 15 minutos em horário de mercado, busca preços e cotações
-intradiárias no Yahoo Finance mais o CDI no Banco Central, calcula as séries
-e o CAPM, e escreve `data/portfolio_data.json` — que a página lê a cada F5.
+intradiárias no Yahoo Finance mais o CDI no Banco Central, e escreve
+`data/portfolio_data.json` — que a página lê a cada F5.
 
-O navegador não consegue chamar o Yahoo direto (a API deles não envia
-cabeçalhos CORS) e proxies públicos são bloqueados por rate limit em poucos
-minutos, por isso o fetch acontece do lado do servidor. Para preços live a
-cada F5 seria preciso um proxy próprio (ex.: Cloudflare Worker).
+O script é só um coletor: ele grava `dates`, `close` e a cotação do dia. Todo
+o resto (drawdown, volatilidade e Sharpe rolantes, covariância, correlação,
+CAPM e as métricas da carteira) é calculado no navegador por `js/stats.js`, a
+partir dos mesmos arrays. É isso que permite recalcular tudo quando chega um
+preço ao vivo, sem ter duas implementações da mesma conta.
+
+## Preços live via Cloudflare Worker
+
+Por padrão os preços vêm do JSON do Actions (até ~15 min de defasagem). Para
+ter preço ao vivo a cada F5, suba o Worker — o navegador não consegue chamar
+o Yahoo direto, porque a API deles não envia cabeçalhos CORS, e proxies
+públicos bloqueiam por rate limit em poucos minutos.
+
+```bash
+cd worker
+npx wrangler login
+npx wrangler deploy
+```
+
+O wrangler imprime a URL (`https://carteirajgp-yahoo-proxy.<você>.workers.dev`).
+Cole ela em `js/config.js`:
+
+```js
+const LIVE_PROXY_URL = "https://carteirajgp-yahoo-proxy.seu-usuario.workers.dev";
+```
+
+Faça commit e pronto. O cabeçalho passa a mostrar **● ao vivo** com o horário
+da cotação. O Worker é grátis no plano free da Cloudflare (100k requisições/dia),
+só aceita os 6 tickers da carteira — não é um proxy aberto — e guarda cache de
+60s para não esbarrar em rate limit do Yahoo.
+
+Se a URL ficar vazia, ou o Worker cair, a página continua funcionando com os
+preços do Actions e avisa no cabeçalho. Nada quebra.
 
 ## Rodar localmente
 

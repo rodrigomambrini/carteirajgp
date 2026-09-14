@@ -1,0 +1,10 @@
+name = "carteirajgp-yahoo-proxy"
+main = "yahoo-proxy.js"
+compatibility_date = "2026-09-14"
+
+# Deploy from this folder:
+#   npx wrangler login
+#   npx wrangler deploy
+#
+# Wrangler prints the live URL (https://carteirajgp-yahoo-proxy.<subdomínio>.workers.dev).
+# Paste that URL into js/config.js as LIVE_PROXY_URL and commit.

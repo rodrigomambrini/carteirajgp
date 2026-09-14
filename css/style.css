@@ -207,6 +207,10 @@ table.orders-table td{ text-align:right; padding:9px 14px; font-family:"IBM Plex
 .chart-wide{ margin-bottom:14px; }
 table.comp-table tr.total-row td{ border-top:1px solid var(--border-strong); font-weight:700; color:var(--text-primary); }
 header.top .updated .age{ color:var(--text-secondary); }
+.live-status{ display:inline-flex; align-items:center; gap:5px; font-size:0.7rem; color:var(--text-muted); margin-top:2px; }
+.live-status.live{ color:var(--good-text); }
+.live-dot{ width:7px; height:7px; border-radius:50%; background:var(--good); box-shadow:0 0 0 3px rgba(63,185,80,0.18); }
+.live-dot.off{ background:var(--text-muted); box-shadow:none; }
 
 /* --- Section 1: Composição --- */
 .comp-grid{ display:grid; grid-template-columns:340px 1fr; gap:22px; margin-bottom:8px; }

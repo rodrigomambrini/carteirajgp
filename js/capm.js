@@ -1,9 +1,11 @@
 /*
- * CAPM table + beta bar chart. Beta/alpha/expected-return themselves are
- * computed server-side (scripts/fetch_and_compute.py, OLS regression of each
- * asset's daily returns on the S&P 500's over the last capm_window_days) —
- * this file only renders what's already in data.assets[sym].capm.
+ * CAPM table + beta bar chart. The regression itself lives in js/stats.js
+ * (computeCapmFor), so these numbers are recomputed from the close arrays on
+ * every load — including after live quotes patch them. This file only renders
+ * whatever is currently in data.assets[sym].capm.
  */
+
+let capmChart = null;
 
 function renderCapm(data) {
   const rows = ASSET_ORDER.map(sym => {
@@ -23,7 +25,10 @@ function renderCapm(data) {
     <tbody>${rows}</tbody>
   `;
 
-  new Chart(document.getElementById("chart-capm-beta").getContext("2d"), {
+  // Destroy before recreating: renderCapm runs again when live quotes arrive,
+  // and Chart.js refuses to reuse a canvas that still owns a chart.
+  if (capmChart) capmChart.destroy();
+  capmChart = new Chart(document.getElementById("chart-capm-beta").getContext("2d"), {
     type: "bar",
     data: {
       labels: ASSET_ORDER,

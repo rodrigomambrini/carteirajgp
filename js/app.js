@@ -319,35 +319,6 @@ function renderCorrelation() {
 
 // --- Section 4: Performance ---------------------------------------------------
 
-function computeSeriesFromReturns(dates, rets) {
-  const perf = [100.0];
-  for (let i = 1; i < rets.length; i++) perf.push(perf[i - 1] * (1 + rets[i]));
-
-  let peak = perf[0];
-  const drawdown = perf.map(p => { peak = Math.max(peak, p); return (p / peak - 1) * 100; });
-
-  const VOL_W = 21, SHARPE_W = 63;
-  const rollVol = new Array(dates.length).fill(null);
-  const rollSharpe = new Array(dates.length).fill(null);
-  const stat = arr => {
-    const m = arr.reduce((a, b) => a + b, 0) / arr.length;
-    const v = arr.reduce((s, r) => s + (r - m) ** 2, 0) / (arr.length - 1);
-    return { m, sd: Math.sqrt(v) };
-  };
-  for (let i = VOL_W; i < dates.length; i++) {
-    const win = rets.slice(i - VOL_W + 1, i + 1).filter(r => r != null);
-    if (win.length < VOL_W - 1) continue;
-    rollVol[i] = stat(win).sd * Math.sqrt(TRADING_DAYS) * 100;
-  }
-  for (let i = SHARPE_W; i < dates.length; i++) {
-    const win = rets.slice(i - SHARPE_W + 1, i + 1).filter(r => r != null);
-    if (win.length < SHARPE_W - 1) continue;
-    const { m, sd } = stat(win);
-    rollSharpe[i] = sd > 0 ? (m / sd) * Math.sqrt(TRADING_DAYS) : null;
-  }
-  return { dates, perf_index: perf, drawdown_pct: drawdown, rolling_vol_pct: rollVol, rolling_sharpe: rollSharpe };
-}
-
 function computeLivePortfolioSeries() {
   const rets = [null];
   for (let i = 1; i < COMMON_DATES.length; i++) {
@@ -359,7 +330,8 @@ function computeLivePortfolioSeries() {
     });
     rets.push(r);
   }
-  return computeSeriesFromReturns(COMMON_DATES, rets);
+  // Same rolling math js/stats.js applies to the individual assets.
+  return { dates: COMMON_DATES, ...rollingSeriesFromReturns(rets) };
 }
 
 function seriesSlice(series, days) {
@@ -571,7 +543,7 @@ function renderShell() {
         <h1>Carteira JGP</h1>
         <div class="sub">XLK · XLE · EWZ · XLY · GLD + caixa — dashboard interativo de risco e retorno</div>
       </div>
-      <div class="updated">Preços atualizados<br><strong>${updated.toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" })} UTC</strong><br><span class="age">${ageLabel}</span></div>
+      <div class="updated">Preços atualizados<br><strong>${updated.toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" })} UTC</strong><br><span class="age">${ageLabel}</span><br><span class="live-status" id="live-status"></span></div>
     </header>
     <div class="disclaimer-banner">⚠️ Ferramenta educacional/analítica. Todos os números vêm de dados históricos (Yahoo Finance) e não constituem recomendação de investimento — retorno passado não garante retorno futuro.</div>
 
@@ -655,15 +627,9 @@ function renderShell() {
   `;
 }
 
-async function loadData() {
-  const res = await fetch(`data/portfolio_data.json?t=${Date.now()}`, { cache: "no-store" });
-  if (!res.ok) throw new Error("Falha ao carregar data/portfolio_data.json.");
-  DATA = await res.json();
-
-  DEFAULT_STATE = { weights: {}, sides: {} };
-  DATA.portfolio.positions.forEach(p => { DEFAULT_STATE.weights[p.symbol] = p.weight * 100; DEFAULT_STATE.sides[p.symbol] = p.side; });
-  STATE = { weights: { ...DEFAULT_STATE.weights }, sides: { ...DEFAULT_STATE.sides } };
-
+// Rebuilt whenever the underlying close arrays change (initial load, and
+// again after live quotes patch them).
+function rebuildReturnMaps() {
   let dates = DATA.assets[ASSET_ORDER[0]].dates;
   ASSET_ORDER.slice(1).forEach(sym => {
     const set = new Set(DATA.assets[sym].dates);
@@ -678,8 +644,102 @@ async function loadData() {
     for (let i = 1; i < a.dates.length; i++) byDate[a.dates[i]] = a.close[i] / a.close[i - 1] - 1;
     ASSET_RET_BY_DATE[sym] = byDate;
   });
+}
 
+async function loadData() {
+  const res = await fetch(`data/portfolio_data.json?t=${Date.now()}`, { cache: "no-store" });
+  if (!res.ok) throw new Error("Falha ao carregar data/portfolio_data.json.");
+  DATA = await res.json();
+
+  DEFAULT_STATE = { weights: {}, sides: {} };
+  DATA.portfolio.positions.forEach(p => { DEFAULT_STATE.weights[p.symbol] = p.weight * 100; DEFAULT_STATE.sides[p.symbol] = p.side; });
+  STATE = { weights: { ...DEFAULT_STATE.weights }, sides: { ...DEFAULT_STATE.sides } };
+
+  rebuildReturnMaps();
   DAILY_RF = Math.pow(1 + DATA.risk_free.rf_annual_pct / 100, 1 / 252) - 1;
+}
+
+// --- Live prices (Cloudflare Worker) -----------------------------------------
+
+function setLiveStatus(state, detail = "") {
+  const el = document.getElementById("live-status");
+  if (!el) return;
+  const map = {
+    live: `<span class="live-dot"></span>ao vivo${detail ? " · " + detail : ""}`,
+    snapshot: `preços do GitHub Actions`,
+    error: `<span class="live-dot off"></span>live indisponível — usando último snapshot`,
+  };
+  el.className = "live-status " + state;
+  el.innerHTML = map[state] || "";
+}
+
+async function fetchLiveQuotes() {
+  if (!LIVE_PROXY_URL) return null;
+  const symbols = [...ASSET_ORDER, DATA.benchmark.symbol].join(",");
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), LIVE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${LIVE_PROXY_URL}?symbols=${encodeURIComponent(symbols)}&t=${Date.now()}`,
+      { signal: ac.signal, cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const payload = await res.json();
+    return payload.quotes || null;
+  } catch (err) {
+    return { __error: err.name === "AbortError" ? "timeout" : err.message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Replaces today's partial bar, or appends a new one if the quote is from a
+// session the committed JSON doesn't cover yet (first refresh of the day,
+// before the Actions cron has run).
+function patchSeriesWithQuote(series, q) {
+  if (!q || q.error || q.price == null || !q.date) return false;
+  const lastDate = series.dates[series.dates.length - 1];
+  if (q.date === lastDate) {
+    if (series.close[series.close.length - 1] === q.price) return false;
+    series.close[series.close.length - 1] = q.price;
+  } else if (q.date > lastDate) {
+    series.dates.push(q.date);
+    series.close.push(q.price);
+  } else {
+    return false; // stale quote, older than what we already have
+  }
+  return true;
+}
+
+async function applyLiveQuotes() {
+  const quotes = await fetchLiveQuotes();
+  if (!quotes) { setLiveStatus("snapshot"); return; }
+  if (quotes.__error) { setLiveStatus("error"); return; }
+
+  let patched = 0;
+  ASSET_ORDER.forEach(sym => {
+    const q = quotes[sym];
+    if (patchSeriesWithQuote(DATA.assets[sym], q)) patched++;
+    if (q && !q.error && q.price != null) {
+      DATA.assets[sym].quote = {
+        last_price: q.price, open: q.open, day_high: q.high, day_low: q.low,
+        previous_close: q.previousClose, volume: q.volume,
+        change_pct: q.previousClose ? (q.price / q.previousClose - 1) * 100 : null,
+        quote_time_utc: q.time,
+      };
+    }
+  });
+  patchSeriesWithQuote(DATA.benchmark, quotes[DATA.benchmark.symbol]);
+
+  // Re-derive everything from the patched closes: series, covariance,
+  // correlation and CAPM all come out of the same arrays.
+  initStats(DATA);
+  rebuildReturnMaps();
+  renderQuotes();
+  renderCapm(DATA);
+  renderAll();
+
+  const stamp = ASSET_ORDER.map(s => DATA.assets[s].quote?.quote_time_utc).filter(Boolean).sort().pop();
+  const time = stamp ? new Date(stamp).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }) : "";
+  setLiveStatus("live", time ? `${time} (seu fuso)` : `${patched} ativos`);
 }
 
 async function init() {
@@ -690,14 +750,17 @@ async function init() {
     root.innerHTML = `<div class="load-error">Não foi possível carregar os dados: ${err.message}</div>`;
     return;
   }
+  initStats(DATA);      // js/stats.js — derived series, CAPM, COV/CORR/RF
   renderShell();
   renderQuotes();
   renderOrders();
   renderControlPanel();
   buildRangeButtons();
-  initStats(DATA);      // js/stats.js — COV / CORR / ANN_RETURN / SIGMA / RF
   renderCapm(DATA);     // js/capm.js
   renderAll();
+  // Deliberately after the first paint: the page is already usable on the
+  // committed snapshot, so a slow or missing Worker never delays it.
+  applyLiveQuotes();
 }
 
 init();
