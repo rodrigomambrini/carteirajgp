@@ -1,13 +1,22 @@
 {
-  "capital_usd": 1000000,
+  "capital_usd": 100000000,
   "benchmark_symbol": "^GSPC",
   "benchmark_name": "S&P 500",
+  "cash_rule": "allocation",
   "positions": [
-    { "symbol": "XLK", "name": "Technology Select Sector SPDR Fund", "weight": 0.20, "side": "long" },
-    { "symbol": "XLE", "name": "Energy Select Sector SPDR Fund", "weight": 0.15, "side": "long" },
+    { "symbol": "XLK", "name": "Technology Select Sector SPDR Fund", "weight": 0.30, "side": "long" },
+    { "symbol": "XLE", "name": "Energy Select Sector SPDR Fund", "weight": 0.20, "side": "long" },
     { "symbol": "EWZ", "name": "iShares MSCI Brazil ETF", "weight": 0.10, "side": "long" },
     { "symbol": "XLY", "name": "Consumer Discretionary Select Sector SPDR Fund", "weight": 0.10, "side": "short" },
-    { "symbol": "GLD", "name": "SPDR Gold Shares", "weight": 0.10, "side": "long" }
+    { "symbol": "GLD", "name": "SPDR Gold Shares", "weight": 0.15, "side": "long" }
   ],
-  "cash_weight": 0.35
+  "lots": [
+    { "symbol": "XLE", "weight": 0.20, "side": "long", "order_type": "Mercado", "status": "executada", "trigger_price": null, "note": null },
+    { "symbol": "XLK", "weight": 0.10, "side": "long", "order_type": "PF", "status": "pendente", "trigger_price": 181.50, "note": "Executada na abertura" },
+    { "symbol": "XLK", "weight": 0.10, "side": "long", "order_type": "PF", "status": "pendente", "trigger_price": 180.16, "note": "Executada na abertura" },
+    { "symbol": "XLK", "weight": 0.10, "side": "long", "order_type": "Mercado", "status": "executada", "trigger_price": null, "note": null },
+    { "symbol": "EWZ", "weight": 0.10, "side": "long", "order_type": "PF", "status": "pendente", "trigger_price": 36.85, "note": "Executada na abertura" },
+    { "symbol": "XLY", "weight": 0.10, "side": "short", "order_type": "Mercado", "status": "executada", "trigger_price": null, "note": null },
+    { "symbol": "GLD", "weight": 0.15, "side": "long", "order_type": "Mercado", "status": "executada", "trigger_price": null, "note": null }
+  ]
 }

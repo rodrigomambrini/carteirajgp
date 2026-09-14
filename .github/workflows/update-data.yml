@@ -2,8 +2,13 @@ name: Update portfolio data
 
 on:
   schedule:
-    # Hourly, 13:00-21:00 UTC = 10:00-18:00 America/Sao_Paulo, Mon-Fri (NYSE session)
-    - cron: "0 13-21 * * 1-5"
+    # Every 15 min, 13:00-21:00 UTC = 10:00-18:00 America/Sao_Paulo, Mon-Fri
+    # (NYSE session). This is what makes a page refresh show near-live prices:
+    # the browser can't fetch Yahoo directly (no CORS headers) and public CORS
+    # proxies rate-limit within minutes, so the JSON this job commits is the
+    # freshness ceiling. GitHub often delays scheduled runs under load, so
+    # treat ~15 min as a floor, not a guarantee.
+    - cron: "*/15 13-21 * * 1-5"
   workflow_dispatch: {}
 
 permissions:

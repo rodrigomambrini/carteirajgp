@@ -1,24 +1,26 @@
 """
-Fetches daily price history from Yahoo Finance for the 5 positions held in
-Rodrigo's carteira (XLK, XLE, EWZ, XLY long/short, GLD) plus the S&P 500
-(^GSPC) as the CAPM benchmark, and CDI (Banco Central) as the risk-free rate.
+Fetches price data from Yahoo Finance for the 5 positions in Rodrigo's
+carteira (XLK, XLE, EWZ, XLY, GLD) plus the S&P 500 (^GSPC) as the CAPM
+benchmark, and CDI (Banco Central) as the risk-free rate.
 
-Computes, per asset: price/performance/drawdown/rolling-vol/rolling-Sharpe
-series (same method as the desafiojgp project, reused here), plus CAPM
-beta/alpha vs the benchmark over the last CAPM_WINDOW trading days.
+Per asset it writes: the daily price/drawdown/rolling-vol/rolling-Sharpe
+series, an intraday `quote` block (last price, open/high/low, volume, market
+state), and a `capm` block (OLS beta/alpha vs the benchmark over the last
+CAPM_WINDOW trading days).
 
-Also computes an aggregated "Carteira" daily series (signed weights - XLY is
-held SHORT, so its daily return is subtracted, not added - plus cash earning
-the daily CDI rate) and portfolio-level aggregate metrics: expected return,
-volatility (from the covariance matrix using signed weights), Sharpe, beta,
-alpha, 1-day 95% parametric VaR, and Euler risk-contribution by position.
+Portfolio-level numbers are deliberately NOT computed here — the page
+recomputes return/vol/Sharpe/beta/alpha/VaR/risk-contribution in the browser
+from whatever weights the user sets in the "Ajuste a carteira" panel, so a
+server-side snapshot of them would just be a stale duplicate.
 
-Writes data/portfolio_data.json, read by js/app.js and js/markowitz.js.
-Run manually or via .github/workflows/update-data.yml on a schedule.
+Writes data/portfolio_data.json. Run manually or via
+.github/workflows/update-data.yml, which runs every 15 minutes during market
+hours so a page refresh always picks up near-live prices.
 """
 import json
 import math
 import os
+import urllib.parse
 import urllib.request
 import datetime
 
@@ -29,42 +31,68 @@ with open(os.path.join(DATA_DIR, "portfolio.json"), encoding="utf-8") as f:
     PORTFOLIO = json.load(f)
 
 ASSET_NAMES = {p["symbol"]: p["name"] for p in PORTFOLIO["positions"]}
-ASSET_SIDE = {p["symbol"]: (1 if p["side"] == "long" else -1) for p in PORTFOLIO["positions"]}
-ASSET_WEIGHT = {p["symbol"]: p["weight"] for p in PORTFOLIO["positions"]}
 ASSET_ORDER = [p["symbol"] for p in PORTFOLIO["positions"]]
-CASH_WEIGHT = PORTFOLIO["cash_weight"]
 BENCHMARK_SYMBOL = PORTFOLIO["benchmark_symbol"]
 
 VOL_WINDOW = 21
 SHARPE_WINDOW = 63
 TRADING_DAYS = 252
-CAPM_WINDOW = 252          # 1 trading year for beta/alpha and portfolio vol/VaR
-YEARS_TO_KEEP = 11         # enough daily history for a long-window correlation view client-side
+CAPM_WINDOW = 252    # 1 trading year for beta/alpha
+YEARS_TO_KEEP = 11   # long history so the "Max" range and the correlation window have room
+
+
+def _get_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.load(resp)
 
 
 def fetch_daily(symbol):
+    """Daily closes. During market hours Yahoo includes a partial bar for the
+    current session, so the last point already carries today's live price."""
     url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}"
         f"?period1=0&period2=9999999999&interval=1d&events=history"
     )
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        payload = json.load(resp)
-    result = payload["chart"]["result"][0]
+    result = _get_json(url)["chart"]["result"][0]
     ts = result["timestamp"]
     quote = result["indicators"]["quote"][0]
-    rows = []
+    dedup = {}
     for i in range(len(ts)):
         c = quote["close"][i]
         if c is None:
             continue
-        d = datetime.datetime.utcfromtimestamp(ts[i]).date()
-        rows.append((d, c))
-    rows.sort(key=lambda r: r[0])
-    dedup = {}
-    for d, c in rows:
-        dedup[d] = c
+        dedup[datetime.datetime.utcfromtimestamp(ts[i]).date()] = c
     return sorted(dedup.items())
+
+
+def fetch_quote(symbol):
+    """Current session snapshot: last price, open/high/low, volume, market
+    state. Uses the 5-minute intraday endpoint because its `meta` carries the
+    live regularMarket* fields and its first bar gives the session open."""
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}"
+        f"?range=1d&interval=5m"
+    )
+    result = _get_json(url)["chart"]["result"][0]
+    meta = result.get("meta", {})
+    opens = [o for o in (result.get("indicators", {}).get("quote", [{}])[0].get("open") or []) if o is not None]
+    prev_close = meta.get("chartPreviousClose") or meta.get("previousClose")
+    last = meta.get("regularMarketPrice")
+    return {
+        "last_price": round(last, 4) if last is not None else None,
+        "open": round(opens[0], 4) if opens else None,
+        "day_high": round(meta["regularMarketDayHigh"], 4) if meta.get("regularMarketDayHigh") is not None else None,
+        "day_low": round(meta["regularMarketDayLow"], 4) if meta.get("regularMarketDayLow") is not None else None,
+        "previous_close": round(prev_close, 4) if prev_close is not None else None,
+        "volume": meta.get("regularMarketVolume"),
+        "change_pct": round((last / prev_close - 1) * 100, 4) if last and prev_close else None,
+        "market_state": meta.get("marketState"),
+        "quote_time_utc": (
+            datetime.datetime.utcfromtimestamp(meta["regularMarketTime"]).isoformat() + "Z"
+            if meta.get("regularMarketTime") else None
+        ),
+    }
 
 
 def percentile(sorted_vals, pct):
@@ -141,11 +169,13 @@ def compute_series(dates, closes):
             "latest_rolling_vol_pct": None if not vol_valid else round(vol_valid[-1], 2),
             "latest_rolling_sharpe": None if not sharpe_valid else round(sharpe_valid[-1], 2),
         },
-        "_rets": rets,  # internal use only, stripped before writing to disk
     }
 
 
 def fetch_cdi(start_date, end_date):
+    """Daily CDI (% per day) from the Banco Central SGS API, series 12. The
+    `dados` endpoint hard-caps the date span at 3652 days and 406s past that,
+    so the requested start is clamped."""
     max_span = datetime.timedelta(days=3652)
     if end_date - start_date > max_span:
         start_date = end_date - max_span
@@ -156,45 +186,18 @@ def fetch_cdi(start_date, end_date):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         rows = json.load(resp)
-    dates, rates = [], []
-    for row in rows:
-        d, m, y = row["data"].split("/")
-        dates.append(f"{y}-{m}-{d}")
-        rates.append(float(row["valor"]))
-    return {"dates": dates, "daily_rate_pct": rates}
+    return [float(row["valor"]) for row in rows]
 
 
 def capm_beta_alpha(asset_rets, mkt_rets):
-    """OLS beta/alpha of asset daily returns on market daily returns, both
-    already aligned/truncated to the same length and window."""
+    """OLS beta/alpha of asset daily returns on market daily returns."""
     n = len(asset_rets)
     ma, mm = sum(asset_rets) / n, sum(mkt_rets) / n
     cov = sum((asset_rets[i] - ma) * (mkt_rets[i] - mm) for i in range(n)) / (n - 1)
     var_m = sum((r - mm) ** 2 for r in mkt_rets) / (n - 1)
     beta = cov / var_m if var_m > 0 else 0.0
     alpha_daily = ma - beta * mm
-    alpha_annual_pct = ((1 + alpha_daily) ** TRADING_DAYS - 1) * 100
-    return beta, alpha_annual_pct
-
-
-def cdi_lookup(cdi):
-    """date(iso)->daily rate% lookup with forward-fill for dates before/between CDI points."""
-    pairs = list(zip(cdi["dates"], cdi["daily_rate_pct"]))
-    pairs.sort()
-
-    def get(date_iso):
-        lo, hi = 0, len(pairs) - 1
-        best = pairs[0][1] if pairs else 0.0
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if pairs[mid][0] <= date_iso:
-                best = pairs[mid][1]
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        return best
-
-    return get
+    return beta, ((1 + alpha_daily) ** TRADING_DAYS - 1) * 100
 
 
 def main():
@@ -202,7 +205,7 @@ def main():
     cutoff = today - datetime.timedelta(days=int(365.25 * YEARS_TO_KEEP))
 
     out = {
-        "generated_at_utc": datetime.datetime.utcnow().isoformat() + "Z",
+        "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat() + "Z",
         "vol_window_days": VOL_WINDOW,
         "sharpe_window_days": SHARPE_WINDOW,
         "capm_window_days": CAPM_WINDOW,
@@ -213,148 +216,61 @@ def main():
     raw = {}
     for sym in ASSET_ORDER:
         rows = [(d, c) for d, c in fetch_daily(sym) if d >= cutoff]
-        dates = [d.isoformat() for d, _ in rows]
-        closes = [c for _, c in rows]
-        raw[sym] = compute_series(dates, closes)
-        print(f"{sym}: {len(dates)} rows, last close {closes[-1]:.2f}")
+        raw[sym] = compute_series([d.isoformat() for d, _ in rows], [c for _, c in rows])
+        print(f"{sym}: {len(rows)} daily rows, last {rows[-1][1]:.2f}")
 
     bench_rows = [(d, c) for d, c in fetch_daily(BENCHMARK_SYMBOL) if d >= cutoff]
     bench_dates = [d.isoformat() for d, _ in bench_rows]
     bench_closes = [c for _, c in bench_rows]
-    bench_series = compute_series(bench_dates, bench_closes)
-    print(f"{BENCHMARK_SYMBOL}: {len(bench_dates)} rows")
+    print(f"{BENCHMARK_SYMBOL}: {len(bench_rows)} daily rows")
 
     try:
-        cdi = fetch_cdi(cutoff, today)
-        print(f"CDI: {len(cdi['dates'])} rows")
+        cdi_rates = fetch_cdi(cutoff, today)
+        latest_cdi_daily_pct = cdi_rates[-1] if cdi_rates else 0.0
+        print(f"CDI: {len(cdi_rates)} rows, latest {latest_cdi_daily_pct}%/day")
     except Exception as exc:
         print(f"CDI fetch failed ({exc}); defaulting rf=0")
-        cdi = {"dates": [], "daily_rate_pct": []}
-    cdi_get = cdi_lookup(cdi)
-    latest_cdi_daily_pct = cdi["daily_rate_pct"][-1] if cdi["daily_rate_pct"] else 0.0
+        latest_cdi_daily_pct = 0.0
     rf_annual = (1 + latest_cdi_daily_pct / 100) ** TRADING_DAYS - 1
 
-    # --- CAPM per asset, over the last CAPM_WINDOW common trading days ------
-    bench_date_index = {d: i for i, d in enumerate(bench_dates)}
-    capm = {}
+    bench_close_by_date = dict(zip(bench_dates, bench_closes))
     for sym in ASSET_ORDER:
         s = raw[sym]
-        common_dates = [d for d in s["dates"] if d in bench_date_index]
-        common_dates = common_dates[-(CAPM_WINDOW + 1):]
         asset_close_by_date = dict(zip(s["dates"], s["close"]))
-        bench_close_by_date = dict(zip(bench_dates, bench_closes))
-        a_closes = [asset_close_by_date[d] for d in common_dates]
-        m_closes = [bench_close_by_date[d] for d in common_dates]
+        common = [d for d in s["dates"] if d in bench_close_by_date][-(CAPM_WINDOW + 1):]
+        a_closes = [asset_close_by_date[d] for d in common]
+        m_closes = [bench_close_by_date[d] for d in common]
         a_rets = [a_closes[i] / a_closes[i - 1] - 1 for i in range(1, len(a_closes))]
         m_rets = [m_closes[i] / m_closes[i - 1] - 1 for i in range(1, len(m_closes))]
         beta, alpha_annual_pct = capm_beta_alpha(a_rets, m_rets)
-        mkt_total_return = m_closes[-1] / m_closes[0] - 1
-        mkt_ann_return = (1 + mkt_total_return) ** (TRADING_DAYS / len(m_rets)) - 1
-        asset_total_return = a_closes[-1] / a_closes[0] - 1
-        asset_ann_return = (1 + asset_total_return) ** (TRADING_DAYS / len(a_rets)) - 1
-        expected_capm = rf_annual + beta * (mkt_ann_return - rf_annual)
-        capm[sym] = {
-            "beta": round(beta, 3),
-            "alpha_annual_pct": round(alpha_annual_pct, 2),
-            "expected_capm_pct": round(expected_capm * 100, 2),
-            "realized_return_pct": round(asset_ann_return * 100, 2),
-            "_ann_return": asset_ann_return,
-            "_rets_window": a_rets,
+        mkt_ann = (m_closes[-1] / m_closes[0]) ** (TRADING_DAYS / len(m_rets)) - 1
+        asset_ann = (a_closes[-1] / a_closes[0]) ** (TRADING_DAYS / len(a_rets)) - 1
+
+        try:
+            quote = fetch_quote(sym)
+        except Exception as exc:  # a missing quote shouldn't fail the whole run
+            print(f"{sym}: quote fetch failed ({exc})")
+            quote = {}
+
+        out["assets"][sym] = {
+            **s,
+            "name": ASSET_NAMES[sym],
+            "quote": quote,
+            "capm": {
+                "beta": round(beta, 3),
+                "alpha_annual_pct": round(alpha_annual_pct, 2),
+                "expected_capm_pct": round((rf_annual + beta * (mkt_ann - rf_annual)) * 100, 2),
+                "realized_return_pct": round(asset_ann * 100, 2),
+            },
         }
-        s.pop("_rets", None)
-        out["assets"][sym] = {**s, "name": ASSET_NAMES[sym], "capm": {k: v for k, v in capm[sym].items() if not k.startswith("_")}}
 
-    out["benchmark"] = {**{k: v for k, v in bench_series.items() if k != "_rets"}, "name": PORTFOLIO["benchmark_name"], "symbol": BENCHMARK_SYMBOL}
-    out["risk_free"] = {"rf_annual_pct": round(rf_annual * 100, 3), "source": "CDI (Banco Central SGS 12), anualizado"}
-
-    # --- Aggregate "Carteira" daily series (signed weights + cash @ CDI) ----
-    common_dates = raw[ASSET_ORDER[0]]["dates"]
-    for sym in ASSET_ORDER[1:]:
-        common_dates = [d for d in common_dates if d in set(raw[sym]["dates"])]
-    common_dates.sort()
-
-    asset_ret_by_date = {sym: dict(zip(raw[sym]["dates"], [None] + [
-        raw[sym]["close"][i] / raw[sym]["close"][i - 1] - 1 for i in range(1, len(raw[sym]["close"]))
-    ])) for sym in ASSET_ORDER}
-
-    port_dates, port_rets = [], [None]
-    for i, d in enumerate(common_dates):
-        port_dates.append(d)
-        if i == 0:
-            continue
-        daily_cdi_pct = cdi_get(d)
-        r = CASH_WEIGHT * (daily_cdi_pct / 100)
-        for sym in ASSET_ORDER:
-            ar = asset_ret_by_date[sym].get(d)
-            if ar is not None:
-                r += ASSET_WEIGHT[sym] * ASSET_SIDE[sym] * ar
-        port_rets.append(r)
-
-    port_closes = [100.0]
-    for i in range(1, len(port_rets)):
-        port_closes.append(port_closes[-1] * (1 + port_rets[i]))
-    port_series = compute_series(port_dates, port_closes)
-    port_series.pop("_rets", None)
-    out["portfolio_series"] = port_series
-
-    # --- Covariance (CAPM_WINDOW) with signed weights, for vol/VaR/contribution
-    window_dates = common_dates[-(CAPM_WINDOW + 1):]
-    rets_matrix = {}
-    for sym in ASSET_ORDER:
-        closes = [dict(zip(raw[sym]["dates"], raw[sym]["close"]))[d] for d in window_dates]
-        rets_matrix[sym] = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
-
-    n = len(ASSET_ORDER)
-    means = {sym: sum(rets_matrix[sym]) / len(rets_matrix[sym]) for sym in ASSET_ORDER}
-    cov_daily = [[0.0] * n for _ in range(n)]
-    for i, si in enumerate(ASSET_ORDER):
-        for j, sj in enumerate(ASSET_ORDER):
-            ri, rj = rets_matrix[si], rets_matrix[sj]
-            mi, mj = means[si], means[sj]
-            cov_daily[i][j] = sum((ri[k] - mi) * (rj[k] - mj) for k in range(len(ri))) / (len(ri) - 1)
-
-    signed_w = [ASSET_WEIGHT[sym] * ASSET_SIDE[sym] for sym in ASSET_ORDER]
-    port_var_daily = sum(signed_w[i] * signed_w[j] * cov_daily[i][j] for i in range(n) for j in range(n))
-    port_vol_daily = math.sqrt(max(port_var_daily, 0))
-    port_vol_annual = port_vol_daily * math.sqrt(TRADING_DAYS)
-
-    capital = PORTFOLIO["capital_usd"]
-    var95_1d_pct = 1.645 * port_vol_daily * 100
-    var95_1d_usd = 1.645 * port_vol_daily * capital
-
-    port_ann_return_capm = sum(signed_w[i] * capm[ASSET_ORDER[i]]["expected_capm_pct"] / 100 for i in range(n)) + CASH_WEIGHT * rf_annual
-    port_ann_return_realized = sum(signed_w[i] * capm[ASSET_ORDER[i]]["_ann_return"] for i in range(n)) + CASH_WEIGHT * rf_annual
-    port_beta = sum(signed_w[i] * capm[ASSET_ORDER[i]]["beta"] for i in range(n))
-    port_alpha_pct = sum(signed_w[i] * capm[ASSET_ORDER[i]]["alpha_annual_pct"] for i in range(n))
-    port_sharpe = (port_ann_return_realized - rf_annual) / port_vol_annual if port_vol_annual > 0 else None
-
-    sigma_w_daily = [sum(cov_daily[i][j] * signed_w[j] for j in range(n)) for i in range(n)]
-    contrib = {}
-    for i, sym in enumerate(ASSET_ORDER):
-        contrib[sym] = (signed_w[i] * sigma_w_daily[i] / port_var_daily * 100) if port_var_daily > 0 else 0.0
-    contrib["CASH"] = 0.0
-    enb = 1 / sum((c / 100) ** 2 for c in contrib.values()) if any(contrib.values()) else 1
-    n_effective_assets = n + 1  # + cash slot
-    diversification_pct = max(0.0, min(100.0, ((enb - 1) / (n_effective_assets - 1)) * 100))
-
-    out["portfolio_metrics"] = {
-        "capital_usd": capital,
-        "expected_return_capm_pct": round(port_ann_return_capm * 100, 2),
-        "expected_return_realized_pct": round(port_ann_return_realized * 100, 2),
-        "volatility_annual_pct": round(port_vol_annual * 100, 2),
-        "sharpe": None if port_sharpe is None else round(port_sharpe, 2),
-        "beta": round(port_beta, 3),
-        "alpha_annual_pct": round(port_alpha_pct, 2),
-        "var95_1d_pct": round(var95_1d_pct, 3),
-        "var95_1d_usd": round(var95_1d_usd, 0),
-        "diversification_pct": round(diversification_pct, 1),
-        "risk_contribution_pct": {k: round(v, 1) for k, v in contrib.items()},
-        "risk_free_annual_pct": round(rf_annual * 100, 3),
-        "window_days": CAPM_WINDOW,
+    out["benchmark"] = {
+        "symbol": BENCHMARK_SYMBOL,
+        "name": PORTFOLIO["benchmark_name"],
+        "dates": bench_dates,
+        "close": [round(c, 4) for c in bench_closes],
     }
-
-    for sym in ASSET_ORDER:
-        out["assets"][sym].pop("_rets", None)
+    out["risk_free"] = {"rf_annual_pct": round(rf_annual * 100, 3), "source": "CDI (Banco Central SGS 12), anualizado"}
 
     out_path = os.path.join(DATA_DIR, "portfolio_data.json")
     with open(out_path, "w", encoding="utf-8") as f:

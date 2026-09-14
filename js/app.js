@@ -1,42 +1,32 @@
 /*
- * Carteira JGP — main orchestrator + the interactive "ajuste a carteira"
- * control panel. Loads data/portfolio_data.json (fetched and computed
- * server-side by scripts/fetch_and_compute.py: prices, CAPM beta/alpha) and
- * renders every section of the single-page dashboard.
+ * Carteira JGP — main orchestrator and the interactive "Ajuste a carteira"
+ * control panel.
  *
- * STATE {weights, sides} holds the CURRENT portfolio the user is looking
- * at — it starts equal to the real allocation in data/portfolio.json, but
- * every slider/toggle in the control panel mutates it and re-renders
- * sections 1 (composição), 2 (correlação — the interpretation and the
- * heatmap's per-asset weight badges), 3 (a recomputed "Carteira" line), 6
- * (métricas agregadas) and 7 (recomendação) from the CURRENT state, not the
- * original allocation. Section 4 (Markowitz/fronteira) is intentionally a
- * SEPARATE long-only what-if tool over the same 5 tickers (js/markowitz.js
- * already made it interactive) — it does not drive or get driven by STATE,
- * since simulating shorts+cash through an efficient frontier is a different
- * problem than this control panel's job. js/capm.js renders section 5,
- * which is per-asset and doesn't depend on weights at all.
+ * WEIGHTS ARE INDEPENDENT. Moving one position's slider changes only that
+ * position; cash is the slack variable that absorbs the difference
+ * (cash = 100% - sum of all position weights, shorts included — per
+ * Rodrigo's explicit rule, a short consumes allocation rather than
+ * crediting cash). A slider is clamped so the allocated total can never
+ * exceed 100%, which keeps cash >= 0 and the grand total at exactly 100%.
  *
- * Live recompute reuses js/markowitz.js's COV/ANN_RETURN/RF/portfolioVariance
- * (63-trading-day window) rather than introducing a second covariance
- * calculation client-side — one shared source of truth for "current
- * weights" math. The "Carteira" performance line (section 3) is instead
- * rebuilt directly from each asset's daily close prices (full history) plus
- * a flat daily rate derived from the current CDI (data.risk_free), since
- * the JSON doesn't carry a full historical CDI series to the client.
+ * Everything below the panel recomputes from STATE on every change:
+ * composition, the correlation section's ranking, the "Carteira" line,
+ * aggregate metrics and the written analysis.
  *
- * All three JS files (capm.js, markowitz.js, app.js) share one global scope
- * (classic <script> tags, no modules), so consts/functions declared here
- * are visible there and vice versa.
+ * DATA FRESHNESS: the browser cannot fetch Yahoo Finance directly (their
+ * chart API sends no CORS headers) and public CORS proxies rate-limit within
+ * minutes of light use — both verified by testing, not assumed. So
+ * scripts/fetch_and_compute.py runs every 15 minutes during market hours via
+ * GitHub Actions and commits data/portfolio_data.json, and this page fetches
+ * that file cache-busted on every load. A refresh therefore shows prices
+ * that are at most one cron interval old, with no manual step.
  *
- * No live browser-side fetch to Yahoo Finance: their chart API doesn't send
- * CORS headers, so a client-side fetch would fail. Same pattern as the
- * desafiojgp project — python fetches + computes, GitHub Actions commits the
- * JSON, the page just reads a static file.
+ * js/stats.js computes COV/CORR/ANN_RETURN/SIGMA/RF; js/capm.js renders the
+ * CAPM table. All three files share one global scope (classic <script> tags,
+ * no modules), loaded capm.js -> stats.js -> app.js.
  */
 
 const ASSET_ORDER = ["XLK", "XLE", "EWZ", "XLY", "GLD"];
-const ALL_KEYS = [...ASSET_ORDER, "CASH"];
 const ACCENT_VAR = { XLK: "--accent-xlk", XLE: "--accent-xle", EWZ: "--accent-ewz", XLY: "--accent-xly", GLD: "--accent-gld", CASH: "--accent-cash", PORT: "--accent-port" };
 const RANGES = [
   { key: "1m", label: "1M", days: 21 },
@@ -49,34 +39,39 @@ const RANGES = [
 const DEFAULT_RANGE_KEY = "1y";
 
 let DATA = null;
-let ASSET_NAME = {};       // symbol -> display name
-let DEFAULT_STATE = null;  // {weights:{...}, sides:{...}} from data/portfolio.json — used by the reset button
-let STATE = null;          // live, mutated by the control panel
+let DEFAULT_STATE = null;
+let STATE = null;
 let currentRange = null;
 const perfCharts = {};
 let pieChart = null;
 
-// precomputed once at load, used to rebuild the "Carteira" line for any weights
 let COMMON_DATES = [];
-let ASSET_RET_BY_DATE = {}; // sym -> {date: dailyReturn}
+let ASSET_RET_BY_DATE = {};
 let DAILY_RF = 0;
 
 function fmtPct(v, digits = 2) { if (v === null || v === undefined || Number.isNaN(v)) return "—"; return (v >= 0 ? "+" : "") + v.toFixed(digits) + "%"; }
 function fmtNum(v, digits = 2) { if (v === null || v === undefined || Number.isNaN(v)) return "—"; return v.toFixed(digits); }
-function fmtUsd(v) { if (v === null || v === undefined) return "—"; return "$" + Math.round(v).toLocaleString("en-US"); }
+function fmtMoney(v) { if (v === null || v === undefined) return "—"; const sign = v < 0 ? "-" : ""; return `${sign}$${(Math.abs(v) / 1e6).toFixed(1)}M`; }
+function fmtVolume(v) { if (!v) return "—"; return v >= 1e6 ? (v / 1e6).toFixed(1) + "M" : (v / 1e3).toFixed(0) + "k"; }
 function fmtDateShort(iso) { const [y, m, d] = iso.split("-"); return d + "/" + m + "/" + y.slice(2); }
 function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 function accentColor(sym) { return cssVar(ACCENT_VAR[sym]); }
 
-// --- STATE helpers -----------------------------------------------------------
+// --- STATE ------------------------------------------------------------------
 
+function allocatedPct() { return ASSET_ORDER.reduce((s, sym) => s + STATE.weights[sym], 0); }
+function cashPct() { return Math.max(0, 100 - allocatedPct()); }
 function signedFrac(sym) { return (STATE.weights[sym] / 100) * (STATE.sides[sym] === "short" ? -1 : 1); }
-function cashFrac() { return STATE.weights.CASH / 100; }
+function cashFrac() { return cashPct() / 100; }
+
+// Independent weights: only `sym` moves. Clamped so the allocated total can't
+// pass 100% — the remainder is cash, which must stay >= 0.
+function setWeight(sym, value) {
+  const others = allocatedPct() - STATE.weights[sym];
+  STATE.weights[sym] = Math.max(0, Math.min(Number(value) || 0, 100 - others));
+}
 
 function liveStats() {
-  // Reuses COV / ANN_RETURN / RF / portfolioVariance from js/markowitz.js
-  // (WINDOW = 63 trading days) — one shared covariance source for every
-  // "current weights" computation on the page.
   const w = ASSET_ORDER.map(signedFrac);
   const wObj = Object.fromEntries(ASSET_ORDER.map((sym, i) => [sym, w[i]]));
   const ret = ASSET_ORDER.reduce((s, sym, i) => s + w[i] * ANN_RETURN[sym], 0) + cashFrac() * RF;
@@ -91,50 +86,49 @@ function liveStats() {
   ASSET_ORDER.forEach((sym, i) => { contrib[sym] = variance > 0 ? (w[i] * sigmaW[i]) / variance * 100 : 0; });
   contrib.CASH = 0;
   const sumSq = Object.values(contrib).reduce((s, c) => s + (c / 100) ** 2, 0);
-  const enb = sumSq > 0 ? 1 / sumSq : ALL_KEYS.length;
-  const diversification = Math.max(0, Math.min(100, ((enb - 1) / (ALL_KEYS.length - 1)) * 100));
+  const enb = sumSq > 0 ? 1 / sumSq : ASSET_ORDER.length + 1;
+  const diversification = Math.max(0, Math.min(100, ((enb - 1) / ASSET_ORDER.length) * 100));
 
   const dailyVol = vol / Math.sqrt(TRADING_DAYS);
   const capital = DATA.portfolio.capital_usd;
   return {
-    ret, vol, sharpe, beta, alphaPct, contrib, diversification,
+    ret, vol, sharpe, beta, alphaPct, contrib, diversification, variance, capital,
     var95_1d_pct: 1.645 * dailyVol * 100,
     var95_1d_usd: 1.645 * dailyVol * capital,
-    capital, variance,
   };
 }
 
-// --- Control panel (drives sections 1, 2, 3's portfolio line, 6, 7) ---------
-
-function normalizeOthersOnDrag(sym, newVal) {
-  const others = ALL_KEYS.filter(k => k !== sym);
-  const remaining = 100 - newVal;
-  const othersSum = others.reduce((s, o) => s + STATE.weights[o], 0);
-  if (othersSum <= 0.001) others.forEach(o => { STATE.weights[o] = remaining / others.length; });
-  else others.forEach(o => { STATE.weights[o] = (STATE.weights[o] / othersSum) * remaining; });
-  STATE.weights[sym] = newVal;
-}
+// --- Section 1: control panel ------------------------------------------------
 
 function renderControlPanel() {
-  document.getElementById("control-sliders").innerHTML = ALL_KEYS.map(sym => {
-    const isCash = sym === "CASH";
-    const side = STATE.sides[sym];
-    return `
+  document.getElementById("control-sliders").innerHTML = ASSET_ORDER.map(sym => `
     <div class="control-row" style="--slider-accent:${accentColor(sym)}">
       <div class="control-head">
         <span class="name"><span class="asset-dot" style="background:${accentColor(sym)}"></span>${sym}</span>
-        ${isCash ? `<span class="side-tag cash">CAIXA</span>` : `<button type="button" class="side-toggle ${side}" data-sym="${sym}">${side === "short" ? "SHORT" : "LONG"}</button>`}
-        <span class="val num" id="control-val-${sym}">${fmtNum(STATE.weights[sym], 1)}%</span>
+        <button type="button" class="side-toggle ${STATE.sides[sym]}" data-sym="${sym}">${STATE.sides[sym] === "short" ? "SHORT" : "LONG"}</button>
+        <span class="control-value">
+          <input type="number" class="weight-input num" id="control-input-${sym}" min="0" max="100" step="0.5" value="${STATE.weights[sym]}" />%
+        </span>
       </div>
       <input type="range" min="0" max="100" step="0.5" id="control-slider-${sym}" value="${STATE.weights[sym]}" />
+    </div>
+  `).join("") + `
+    <div class="control-row cash-row-control">
+      <div class="control-head">
+        <span class="name"><span class="asset-dot" style="background:${accentColor("CASH")}"></span>CASH</span>
+        <span class="side-tag cash">AUTOMÁTICO</span>
+        <span class="control-value"><span class="num" id="control-val-CASH">—</span></span>
+      </div>
+      <div class="cash-bar"><div class="cash-bar-fill" id="cash-bar-fill"></div></div>
+      <div class="cash-note">O caixa completa o que sobra para fechar 100% — não é ajustável direto.</div>
     </div>`;
-  }).join("");
 
-  ALL_KEYS.forEach(sym => {
-    document.getElementById("control-slider-" + sym).addEventListener("input", e => {
-      normalizeOthersOnDrag(sym, Math.max(0, Math.min(100, Number(e.target.value))));
-      renderAll();
-    });
+  ASSET_ORDER.forEach(sym => {
+    const slider = document.getElementById("control-slider-" + sym);
+    const input = document.getElementById("control-input-" + sym);
+    const apply = v => { setWeight(sym, v); renderAll(); };
+    slider.addEventListener("input", e => apply(e.target.value));
+    input.addEventListener("change", e => apply(e.target.value));
   });
   document.querySelectorAll(".side-toggle").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -147,101 +141,131 @@ function renderControlPanel() {
     STATE = { weights: { ...DEFAULT_STATE.weights }, sides: { ...DEFAULT_STATE.sides } };
     renderAll();
   });
-  updateControlUI();
 }
 
 function updateControlUI() {
-  ALL_KEYS.forEach(sym => {
+  ASSET_ORDER.forEach(sym => {
     document.getElementById("control-slider-" + sym).value = STATE.weights[sym];
-    document.getElementById("control-val-" + sym).textContent = fmtNum(STATE.weights[sym], 1) + "%";
-  });
-  document.querySelectorAll(".side-toggle").forEach(btn => {
-    const sym = btn.dataset.sym;
+    document.getElementById("control-input-" + sym).value = Number(STATE.weights[sym].toFixed(1));
+    const btn = document.querySelector(`.side-toggle[data-sym="${sym}"]`);
     btn.className = "side-toggle " + STATE.sides[sym];
     btn.textContent = STATE.sides[sym] === "short" ? "SHORT" : "LONG";
   });
-  const total = ALL_KEYS.reduce((s, k) => s + STATE.weights[k], 0);
+  const cash = cashPct();
+  document.getElementById("control-val-CASH").textContent = fmtNum(cash, 1) + "%";
+  document.getElementById("cash-bar-fill").style.width = cash + "%";
   const totalEl = document.getElementById("control-total");
-  totalEl.textContent = `Total: ${total.toFixed(0)}%`;
-  totalEl.className = "slider-total" + (Math.abs(total - 100) < 0.6 ? " ok" : "");
+  totalEl.innerHTML = `Alocado: <strong>${fmtNum(allocatedPct(), 1)}%</strong> · Caixa: <strong>${fmtNum(cash, 1)}%</strong> · Total: <strong>100%</strong>`;
+  totalEl.className = "slider-total" + (cash <= 0.01 ? " maxed" : " ok");
 }
 
-// --- Section 1: Composição --------------------------------------------------
+// --- Section 2: Composição ---------------------------------------------------
 
 function renderComposition() {
   const capital = DATA.portfolio.capital_usd;
   const rows = ASSET_ORDER.map(sym => {
     const weight = STATE.weights[sym] / 100;
     const side = STATE.sides[sym];
-    const price = DATA.assets[sym].stats.last_close;
+    const price = DATA.assets[sym].quote?.last_price ?? DATA.assets[sym].stats.last_close;
     const value = weight * capital * (side === "short" ? -1 : 1);
-    const qty = value / price;
-    return { symbol: sym, weight, side, price, qty, value };
+    return { symbol: sym, weight, side, price, qty: value / price, value };
   });
-  const cashWeight = STATE.weights.CASH / 100;
-  const cashValue = cashWeight * capital;
+  const cash = cashFrac();
 
+  const pieValues = [...ASSET_ORDER.map(sym => STATE.weights[sym]), cashPct()];
   const pieLabels = [...ASSET_ORDER, "CASH"];
-  const pieValues = [...ASSET_ORDER.map(sym => STATE.weights[sym]), STATE.weights.CASH];
   const pieColors = [...ASSET_ORDER.map(accentColor), accentColor("CASH")];
 
   if (pieChart) pieChart.destroy();
   pieChart = new Chart(document.getElementById("chart-composition").getContext("2d"), {
     type: "pie",
-    data: { labels: pieLabels.map((l, i) => `${l} ${pieValues[i].toFixed(0)}%`), datasets: [{ data: pieValues, backgroundColor: pieColors, borderColor: cssVar("--bg"), borderWidth: 2 }] },
+    data: { labels: pieLabels.map((l, i) => `${l} ${pieValues[i].toFixed(1)}%`), datasets: [{ data: pieValues, backgroundColor: pieColors, borderColor: cssVar("--bg"), borderWidth: 2 }] },
     options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { position: "bottom", labels: { color: cssVar("--text-secondary"), font: { size: 11 }, padding: 12 } } },
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: { legend: { position: "bottom", labels: { color: cssVar("--text-secondary"), font: { size: 11 }, padding: 10 } } },
     },
   });
 
-  const rowsHtml = rows.map(r => `
+  document.getElementById("composition-table-body").innerHTML = rows.map(r => `
     <tr class="${r.side === "short" ? "short-row" : ""}">
       <td class="asset-name-cell"><span class="asset-dot" style="background:${accentColor(r.symbol)}"></span>${r.symbol}<span class="side-tag ${r.side}">${r.side === "short" ? "SHORT" : "LONG"}</span></td>
       <td>${(r.weight * 100).toFixed(1)}%</td>
       <td class="num">$${fmtNum(r.price)}</td>
-      <td class="num">${r.qty >= 0 ? "" : "-"}${fmtNum(Math.abs(r.qty), 0)}</td>
-      <td class="num">${r.value >= 0 ? "" : "-"}$${fmtNum(Math.abs(r.value) / 1000, 0)}k</td>
+      <td class="num">${r.qty >= 0 ? "" : "-"}${Math.round(Math.abs(r.qty)).toLocaleString("en-US")}</td>
+      <td class="num">${fmtMoney(r.value)}</td>
     </tr>
-  `).join("");
-
-  document.getElementById("composition-table-body").innerHTML = rowsHtml + `
+  `).join("") + `
     <tr class="cash-row">
       <td class="asset-name-cell"><span class="asset-dot" style="background:${accentColor("CASH")}"></span>CASH<span class="side-tag cash">CAIXA</span></td>
-      <td>${(cashWeight * 100).toFixed(1)}%</td>
+      <td>${(cash * 100).toFixed(1)}%</td>
       <td>—</td>
       <td>—</td>
-      <td class="num">$${fmtNum(cashValue / 1000, 0)}k</td>
+      <td class="num">${fmtMoney(cash * capital)}</td>
     </tr>
-  `;
+    <tr class="total-row">
+      <td>TOTAL</td>
+      <td>100.0%</td>
+      <td>—</td>
+      <td>—</td>
+      <td class="num">${fmtMoney(capital)}</td>
+    </tr>`;
 }
 
-// --- Section 2: Correlação (heatmap values are asset-intrinsic and don't
-// change with weights, but the interpretation below IS driven by STATE —
-// it ranks pairs by how much they actually contribute to the CURRENT
-// portfolio's variance, not just by raw |correlation|.) ----------------------
+// Static order book from data/portfolio.json — the individual lots behind the
+// aggregate weights above (three separate XLK tickets, etc). Not affected by
+// the sliders: it records what was actually sent to the market.
+function renderOrders() {
+  const lots = DATA.portfolio.lots || [];
+  document.getElementById("orders-table-body").innerHTML = lots.map(l => {
+    const pending = l.status === "pendente";
+    return `<tr>
+      <td class="asset-name-cell"><span class="asset-dot" style="background:${accentColor(l.symbol)}"></span>${l.symbol}<span class="side-tag ${l.side}">${l.side === "short" ? "SHORT" : "LONG"}</span></td>
+      <td>${(l.weight * 100).toFixed(0)}%</td>
+      <td class="num">${fmtMoney(l.weight * DATA.portfolio.capital_usd * (l.side === "short" ? -1 : 1))}</td>
+      <td>${l.order_type}</td>
+      <td class="num">${l.trigger_price ? "$" + fmtNum(l.trigger_price) : "—"}</td>
+      <td><span class="status-badge ${pending ? "pending" : "done"}">${pending ? "Pendente" : "Executada"}</span>${l.note ? `<span class="status-note">${l.note}</span>` : ""}</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderQuotes() {
+  document.getElementById("quotes-strip").innerHTML = ASSET_ORDER.map(sym => {
+    const q = DATA.assets[sym].quote || {};
+    const price = q.last_price ?? DATA.assets[sym].stats.last_close;
+    const chg = q.change_pct;
+    const up = (chg ?? 0) >= 0;
+    return `<div class="quote-card" style="--q-accent:${accentColor(sym)}">
+      <div class="quote-head"><span class="asset-dot" style="background:${accentColor(sym)}"></span><strong>${sym}</strong>
+        <span class="pill ${up ? "up" : "down"}">${up ? "&#9650;" : "&#9660;"} ${fmtPct(chg ?? 0)}</span></div>
+      <div class="quote-price num">$${fmtNum(price)}</div>
+      <div class="quote-meta num">A ${fmtNum(q.open)} · Máx ${fmtNum(q.day_high)} · Mín ${fmtNum(q.day_low)} · Vol ${fmtVolume(q.volume)}</div>
+    </div>`;
+  }).join("");
+}
+
+// --- Section 3: Correlação ---------------------------------------------------
 
 function corrColor(v) {
   const hexToRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
-  const rgbToStr = c => `rgb(${c[0]},${c[1]},${c[2]})`;
-  const lerp = (a, b, t) => a.map((v2, i) => Math.round(v2 + (b[i] - v2) * t));
+  const lerp = (a, b, t) => a.map((x, i) => Math.round(x + (b[i] - x) * t));
   const neg = hexToRgb(cssVar("--critical").trim() || "#F85149");
   const neu = hexToRgb("#1c2330");
   const pos = hexToRgb(cssVar("--good").trim() || "#3FB950");
-  if (v >= 0) return rgbToStr(lerp(neu, pos, v));
-  return rgbToStr(lerp(neu, neg, -v));
+  const c = v >= 0 ? lerp(neu, pos, v) : lerp(neu, neg, -v);
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
 }
 
 function renderCorrelation() {
   const corr = window.CORR_MATRIX;
   if (!corr) return;
-  const order = ASSET_ORDER;
 
   const cells = [`<div></div>`];
-  order.forEach(sym => cells.push(`<div class="corr-label">${sym}<span class="corr-label-w">${fmtNum(STATE.weights[sym], 0)}%${STATE.sides[sym] === "short" ? " S" : ""}</span></div>`));
-  order.forEach((symRow, i) => {
-    cells.push(`<div class="corr-label">${symRow}<span class="corr-label-w">${fmtNum(STATE.weights[symRow], 0)}%${STATE.sides[symRow] === "short" ? " S" : ""}</span></div>`);
-    order.forEach((symCol, j) => {
+  const label = sym => `<div class="corr-label">${sym}<span class="corr-label-w">${fmtNum(STATE.weights[sym], 0)}%${STATE.sides[sym] === "short" ? " S" : ""}</span></div>`;
+  ASSET_ORDER.forEach(sym => cells.push(label(sym)));
+  ASSET_ORDER.forEach((symRow, i) => {
+    cells.push(label(symRow));
+    ASSET_ORDER.forEach((symCol, j) => {
       const v = corr[i][j];
       const textColor = Math.abs(v) > 0.55 ? "#0a0e14" : cssVar("--text-primary");
       cells.push(`<div class="corr-cell" style="background:${corrColor(v)}; color:${textColor}">${v.toFixed(2)}</div>`);
@@ -249,40 +273,51 @@ function renderCorrelation() {
   });
   document.getElementById("corr-grid-host").innerHTML = `<div class="corr-grid">${cells.join("")}</div>`;
 
-  // Rank pairs by their actual contribution to the CURRENT portfolio's
-  // variance (2 * w_i * w_j * Cov_ij / total variance) — this is what ties
-  // the correlation section to the weights set in the control panel above,
-  // rather than to a generic, weight-agnostic "most correlated pair" list.
-  const w = order.map(signedFrac);
+  // Pairs ranked by their real share of the CURRENT portfolio's variance
+  // (2*w_i*w_j*Cov_ij / variance, signed weights) rather than by raw
+  // |correlation| — this is what ties the matrix to the weights above.
+  const w = ASSET_ORDER.map(signedFrac);
   const stats = liveStats();
   const pairs = [];
-  for (let i = 0; i < order.length; i++) {
-    for (let j = i + 1; j < order.length; j++) {
-      const crossContrib = stats.variance > 0 ? (2 * w[i] * w[j] * COV[i][j]) / stats.variance * 100 : 0;
-      pairs.push({ a: order[i], b: order[j], v: corr[i][j], contrib: crossContrib });
+  for (let i = 0; i < ASSET_ORDER.length; i++) {
+    for (let j = i + 1; j < ASSET_ORDER.length; j++) {
+      pairs.push({
+        a: ASSET_ORDER[i], b: ASSET_ORDER[j], v: corr[i][j],
+        contrib: stats.variance > 0 ? (2 * w[i] * w[j] * COV[i][j]) / stats.variance * 100 : 0,
+      });
     }
   }
-  const byContrib = [...pairs].sort((a, b) => Math.abs(b.contrib) - Math.abs(a.contrib));
+  pairs.sort((x, y) => Math.abs(y.contrib) - Math.abs(x.contrib));
 
-  const describe = (p) => {
+  // The note is derived from the CONTRIBUTION's sign, never from the
+  // correlation's: the matrix measures the full price history while the
+  // contribution measures the last WINDOW pregões with the current weights,
+  // so the two can legitimately disagree in sign. Reading the note off the
+  // correlation would then contradict the number printed right next to it.
+  const describe = p => {
     const level = Math.abs(p.v) >= 0.6 ? "alta" : Math.abs(p.v) >= 0.3 ? "moderada" : "baixa";
     const sign = p.v >= 0 ? "positiva" : "negativa";
-    let effectNote;
-    const bothLong = STATE.sides[p.a] === "long" && STATE.sides[p.b] === "long";
-    const effectiveSign = (STATE.sides[p.a] === "short" ? -1 : 1) * (STATE.sides[p.b] === "short" ? -1 : 1) * Math.sign(p.v || 1);
-    if (bothLong) effectNote = p.v >= 0 ? "soma risco (as duas posições sobem/descem juntas)" : "efeito diversificador (tendem a compensar)";
-    else effectNote = effectiveSign < 0 ? "efeito diversificador — o short inverte o sinal prático" : "soma risco mesmo com o short — atenção";
-    return `<li><strong>${p.a} × ${p.b}</strong> correlação ${level} ${sign} (${fmtNum(p.v)}) · contribui <strong>${fmtPct(p.contrib, 1)}</strong> do risco da sua carteira atual — ${effectNote}</li>`;
+    const hasShort = STATE.sides[p.a] === "short" || STATE.sides[p.b] === "short";
+    let note;
+    if (Math.abs(p.contrib) < 0.05) {
+      note = `<span class="pair-idle">peso ~0 na carteira, impacto desprezível</span>`;
+    } else if (p.contrib > 0) {
+      note = "soma risco à carteira" + (hasShort ? " mesmo com o short — atenção" : "");
+    } else {
+      note = "reduz o risco da carteira (efeito hedge)" + (hasShort ? " — o short inverte o sinal da correlação" : "");
+    }
+    return `<li><strong>${p.a} × ${p.b}</strong> correlação ${level} ${sign} (${fmtNum(p.v)}) · contribui <strong>${fmtPct(p.contrib, 1)}</strong> do risco da carteira atual — ${note}</li>`;
   };
 
   document.getElementById("corr-interp").innerHTML = `
-    <div class="info-title">📊 Interpretação (de acordo com os pesos definidos acima)</div>
-    <ul>${byContrib.map(describe).join("")}</ul>
+    <div class="info-title">📊 Interpretação (com os pesos definidos acima)</div>
+    <ul>${pairs.map(describe).join("")}</ul>
     <div class="div-score">Diversificação da carteira atual: <strong>${fmtNum(stats.diversification, 0)}%</strong> · volatilidade combinada: <strong>${fmtNum(stats.vol * 100, 1)}%</strong> a.a.</div>
+    <div class="window-note">A correlação da matriz usa todo o histórico carregado (~11 anos, estimativa mais estável). A contribuição ao risco usa os últimos ${WINDOW} pregões com os seus pesos atuais — por isso um par pode ter correlação positiva no longo prazo e estar reduzindo o risco da carteira agora.</div>
   `;
 }
 
-// --- Section 3: Performance ---------------------------------------------------
+// --- Section 4: Performance ---------------------------------------------------
 
 function computeSeriesFromReturns(dates, rets) {
   const perf = [100.0];
@@ -291,26 +326,26 @@ function computeSeriesFromReturns(dates, rets) {
   let peak = perf[0];
   const drawdown = perf.map(p => { peak = Math.max(peak, p); return (p / peak - 1) * 100; });
 
-  const VOL_WINDOW = 21, SHARPE_WINDOW = 63;
+  const VOL_W = 21, SHARPE_W = 63;
   const rollVol = new Array(dates.length).fill(null);
   const rollSharpe = new Array(dates.length).fill(null);
-  for (let i = VOL_WINDOW; i < dates.length; i++) {
-    const window = rets.slice(i - VOL_WINDOW + 1, i + 1).filter(r => r !== null && r !== undefined);
-    if (window.length < VOL_WINDOW - 1) continue;
-    const m = window.reduce((a, b) => a + b, 0) / window.length;
-    const varr = window.reduce((s, r) => s + (r - m) ** 2, 0) / (window.length - 1);
-    rollVol[i] = Math.sqrt(varr) * Math.sqrt(TRADING_DAYS) * 100;
+  const stat = arr => {
+    const m = arr.reduce((a, b) => a + b, 0) / arr.length;
+    const v = arr.reduce((s, r) => s + (r - m) ** 2, 0) / (arr.length - 1);
+    return { m, sd: Math.sqrt(v) };
+  };
+  for (let i = VOL_W; i < dates.length; i++) {
+    const win = rets.slice(i - VOL_W + 1, i + 1).filter(r => r != null);
+    if (win.length < VOL_W - 1) continue;
+    rollVol[i] = stat(win).sd * Math.sqrt(TRADING_DAYS) * 100;
   }
-  for (let i = SHARPE_WINDOW; i < dates.length; i++) {
-    const window = rets.slice(i - SHARPE_WINDOW + 1, i + 1).filter(r => r !== null && r !== undefined);
-    if (window.length < SHARPE_WINDOW - 1) continue;
-    const m = window.reduce((a, b) => a + b, 0) / window.length;
-    const varr = window.reduce((s, r) => s + (r - m) ** 2, 0) / (window.length - 1);
-    const sd = Math.sqrt(varr);
+  for (let i = SHARPE_W; i < dates.length; i++) {
+    const win = rets.slice(i - SHARPE_W + 1, i + 1).filter(r => r != null);
+    if (win.length < SHARPE_W - 1) continue;
+    const { m, sd } = stat(win);
     rollSharpe[i] = sd > 0 ? (m / sd) * Math.sqrt(TRADING_DAYS) : null;
   }
-
-  return { dates, close: perf, perf_index: perf, drawdown_pct: drawdown, rolling_vol_pct: rollVol, rolling_sharpe: rollSharpe };
+  return { dates, perf_index: perf, drawdown_pct: drawdown, rolling_vol_pct: rollVol, rolling_sharpe: rollSharpe };
 }
 
 function computeLivePortfolioSeries() {
@@ -330,16 +365,19 @@ function computeLivePortfolioSeries() {
 function seriesSlice(series, days) {
   const n = series.dates.length;
   const start = days ? Math.max(0, n - days) : 0;
-  return {
-    dates: series.dates.slice(start),
-    perf_index: series.perf_index.slice(start),
-    drawdown_pct: series.drawdown_pct.slice(start),
-    rolling_vol_pct: series.rolling_vol_pct.slice(start),
-    rolling_sharpe: series.rolling_sharpe.slice(start),
-  };
+  const out = { dates: series.dates.slice(start) };
+  ["close", "perf_index", "drawdown_pct", "rolling_vol_pct", "rolling_sharpe"].forEach(k => {
+    if (series[k]) out[k] = series[k].slice(start);
+  });
+  // Re-base an indexed series so it starts at 100 within the visible window.
+  if (out.perf_index && out.perf_index.length) {
+    const base = out.perf_index[0];
+    out.perf_index = out.perf_index.map(v => (v / base) * 100);
+  }
+  return out;
 }
 
-function baseLineOptions(yPrefix = "", ySuffix = "") {
+function baseLineOptions({ yPrefix = "", ySuffix = "", log = false } = {}) {
   return {
     responsive: true, maintainAspectRatio: false, animation: false,
     interaction: { mode: "index", intersect: false },
@@ -349,43 +387,57 @@ function baseLineOptions(yPrefix = "", ySuffix = "") {
         backgroundColor: cssVar("--surface"), titleColor: cssVar("--text-primary"), bodyColor: cssVar("--text-secondary"),
         borderColor: cssVar("--border-strong"), borderWidth: 1, padding: 8,
         titleFont: { family: "IBM Plex Mono", size: 11 }, bodyFont: { family: "IBM Plex Mono", size: 11 },
+        callbacks: { label: ctx => `${ctx.dataset.label}: ${yPrefix}${ctx.parsed.y.toFixed(2)}${ySuffix}` },
       },
     },
     scales: {
       x: { grid: { display: false }, ticks: { color: cssVar("--text-muted"), maxTicksLimit: 7, font: { family: "IBM Plex Mono", size: 10 } } },
-      y: { grid: { color: cssVar("--grid") }, ticks: { color: cssVar("--text-muted"), font: { family: "IBM Plex Mono", size: 10 }, callback: v => yPrefix + v + ySuffix } },
+      y: {
+        type: log ? "logarithmic" : "linear",
+        grid: { color: cssVar("--grid") },
+        ticks: {
+          color: cssVar("--text-muted"), font: { family: "IBM Plex Mono", size: 10 },
+          callback: v => yPrefix + (log ? Number(v).toFixed(0) : v) + ySuffix,
+        },
+      },
     },
   };
 }
 
 function renderPerformanceCharts(range) {
   currentRange = range;
-  const livePortfolioSeries = computeLivePortfolioSeries();
-  const labels = seriesSlice(livePortfolioSeries, range.days).dates.map(fmtDateShort);
-  const lines = [
-    ...ASSET_ORDER.map(sym => ({ sym, name: sym, color: accentColor(sym) })),
-    { sym: "__PORT__", name: "Carteira", color: accentColor("PORT") },
-  ];
+  const portfolio = computeLivePortfolioSeries();
+  const labels = seriesSlice(portfolio, range.days).dates.map(fmtDateShort);
 
-  const mk = (key, canvasId, field, options) => {
+  const assetLines = ASSET_ORDER.map(sym => ({ sym, name: sym, color: accentColor(sym) }));
+  const withPortfolio = [...assetLines, { sym: "__PORT__", name: "Carteira", color: accentColor("PORT") }];
+
+  const mk = (key, canvasId, field, lines, options) => {
     if (perfCharts[key]) perfCharts[key].destroy();
     const datasets = lines.map(l => {
-      const series = l.sym === "__PORT__" ? livePortfolioSeries : DATA.assets[l.sym];
-      const s = seriesSlice(series, range.days);
+      const series = l.sym === "__PORT__" ? portfolio : DATA.assets[l.sym];
       return {
-        label: l.name, data: s[field], borderColor: l.color, backgroundColor: "transparent",
+        label: l.name, data: seriesSlice(series, range.days)[field],
+        borderColor: l.color, backgroundColor: "transparent",
         borderWidth: l.sym === "__PORT__" ? 2.5 : 1.5, pointRadius: 0, spanGaps: true, tension: 0.05,
       };
     });
     perfCharts[key] = new Chart(document.getElementById(canvasId).getContext("2d"), { type: "line", data: { labels, datasets }, options });
   };
 
-  mk("price", "chart-price", "perf_index", baseLineOptions("", ""));
-  mk("dd", "chart-dd", "drawdown_pct", baseLineOptions("", "%"));
-  mk("vol", "chart-vol", "rolling_vol_pct", baseLineOptions("", "%"));
-  mk("sharpe", "chart-sharpe", "rolling_sharpe", baseLineOptions("", ""));
+  // Real USD prices. Log y-axis because the five trade at very different
+  // levels (GLD ~$390 vs EWZ ~$38) — on a linear axis the cheaper names
+  // flatten into the baseline and their moves become unreadable. The
+  // portfolio has no per-share price, so it's absent here and shown on the
+  // indexed chart instead.
+  mk("priceUsd", "chart-price-usd", "close", assetLines, baseLineOptions({ yPrefix: "$", log: true }));
+  mk("priceIdx", "chart-price-idx", "perf_index", withPortfolio, baseLineOptions());
+  mk("dd", "chart-dd", "drawdown_pct", withPortfolio, baseLineOptions({ ySuffix: "%" }));
+  mk("vol", "chart-vol", "rolling_vol_pct", withPortfolio, baseLineOptions({ ySuffix: "%" }));
+  mk("sharpe", "chart-sharpe", "rolling_sharpe", withPortfolio, baseLineOptions());
 
-  document.getElementById("perf-legend").innerHTML = lines.map(l => `<div class="legend-item"><span class="legend-dot" style="background:${l.color}"></span>${l.name}</div>`).join("");
+  document.getElementById("perf-legend").innerHTML = withPortfolio
+    .map(l => `<div class="legend-item"><span class="legend-dot" style="background:${l.color}"></span>${l.name}</div>`).join("");
 }
 
 function buildRangeButtons() {
@@ -415,102 +467,90 @@ function renderAggregateMetrics() {
     <div class="stat"><div class="label">Beta da carteira</div><div class="value num">${fmtNum(m.beta)}</div><div class="note">${m.beta >= 1 ? "mais agressiva que o mercado" : "mais defensiva que o mercado"}</div></div>
     <div class="stat"><div class="label">Alpha da carteira</div><div class="value num" style="color:${m.alphaPct >= 0 ? "var(--good-text)" : "var(--critical-text)"}">${fmtPct(m.alphaPct)}</div><div class="note">vs. CAPM (S&amp;P 500)</div></div>
     <div class="stat"><div class="label">Diversificação</div><div class="value num">${fmtNum(m.diversification, 0)}%</div><div class="note">nº efetivo de posições independentes</div></div>
-    <div class="stat"><div class="label">VaR 95% (1 dia)</div><div class="value num" style="color:var(--critical-text)">-${fmtNum(m.var95_1d_pct, 2)}%</div><div class="note">≈ -${fmtUsd(m.var95_1d_usd)} sobre $${(m.capital / 1e6).toFixed(1)}M</div></div>
-    <div class="stat"><div class="label">Capital de referência</div><div class="value num">$${(m.capital / 1e6).toFixed(1)}M</div><div class="note">usado para os valores em $</div></div>
+    <div class="stat"><div class="label">VaR 95% (1 dia)</div><div class="value num" style="color:var(--critical-text)">-${fmtNum(m.var95_1d_pct, 2)}%</div><div class="note">≈ -${fmtMoney(m.var95_1d_usd)} sobre ${fmtMoney(m.capital)}</div></div>
+    <div class="stat"><div class="label">Patrimônio</div><div class="value num">${fmtMoney(m.capital)}</div><div class="note">capital total da carteira</div></div>
   `;
 
   const contrib = m.contrib;
   const maxAbs = Math.max(...Object.values(contrib).map(Math.abs), 1);
-  document.getElementById("risk-contrib-body").innerHTML = ALL_KEYS.map(sym => {
+  document.getElementById("risk-contrib-body").innerHTML = [...ASSET_ORDER, "CASH"].map(sym => {
     const v = contrib[sym] || 0;
     const barColor = v < 0 ? cssVar("--good") : accentColor(sym);
     const barWidth = (Math.abs(v) / maxAbs) * 100;
-    const barLeft = v < 0 ? 50 - barWidth / 2 : 50;
     return `<tr>
       <td class="asset-name-cell"><span class="asset-dot" style="background:${accentColor(sym)}"></span>${sym}</td>
       <td class="${v < 0 ? "neg" : ""}">${fmtPct(v, 1)}
-        <span class="risk-bar-wrap"><span class="risk-bar" style="left:${barLeft}%; width:${Math.max(barWidth / 2, 1)}%; background:${barColor}"></span></span>
+        <span class="risk-bar-wrap"><span class="risk-bar" style="left:${v < 0 ? 50 - barWidth / 2 : 50}%; width:${Math.max(barWidth / 2, 1)}%; background:${barColor}"></span></span>
       </td>
     </tr>`;
   }).join("");
 }
 
-// --- Section 7: Recomendação --------------------------------------------------
+// --- Section 7: Análise e recomendação ----------------------------------------
 
 function renderRecommendation() {
   const m = liveStats();
   const isAggressive = m.beta >= 1;
   const profileLabel = isAggressive ? "AGRESSIVA" : "MODERADA / DEFENSIVA";
-  const profileColor = isAggressive ? "var(--critical-bg)" : "var(--good-bg)";
-  const profileTextColor = isAggressive ? "var(--critical-text)" : "var(--good-text)";
 
-  const capmMap = Object.fromEntries(ASSET_ORDER.map(s => [s, DATA.assets[s].capm]));
   const corr = window.CORR_MATRIX;
   const w = ASSET_ORDER.map(signedFrac);
   const pairs = [];
   if (corr) {
     for (let i = 0; i < ASSET_ORDER.length; i++) {
       for (let j = i + 1; j < ASSET_ORDER.length; j++) {
-        const crossContrib = m.variance > 0 ? (2 * w[i] * w[j] * COV[i][j]) / m.variance * 100 : 0;
-        pairs.push({ a: ASSET_ORDER[i], b: ASSET_ORDER[j], v: corr[i][j], contrib: crossContrib });
+        pairs.push({
+          a: ASSET_ORDER[i], b: ASSET_ORDER[j], v: corr[i][j],
+          contrib: m.variance > 0 ? (2 * w[i] * w[j] * COV[i][j]) / m.variance * 100 : 0,
+        });
       }
     }
   }
-  const biggestRiskPair = pairs.length ? pairs.reduce((max, p) => (Math.abs(p.contrib) > Math.abs(max.contrib) ? p : max)) : null;
-  const activeSyms = ASSET_ORDER.filter(s => STATE.weights[s] > 0.5);
-  const mostVolatile = activeSyms.length ? activeSyms.reduce((max, s) => (DATA.assets[s].stats.latest_rolling_vol_pct > DATA.assets[max].stats.latest_rolling_vol_pct ? s : max), activeSyms[0]) : null;
-  const hasShort = ASSET_ORDER.some(s => STATE.sides[s] === "short" && STATE.weights[s] > 0.5);
+  const biggestPair = pairs.length ? pairs.reduce((mx, p) => (Math.abs(p.contrib) > Math.abs(mx.contrib) ? p : mx)) : null;
+  const active = ASSET_ORDER.filter(s => STATE.weights[s] > 0.5);
+  const mostVolatile = active.length
+    ? active.reduce((mx, s) => (DATA.assets[s].stats.latest_rolling_vol_pct > DATA.assets[mx].stats.latest_rolling_vol_pct ? s : mx), active[0])
+    : null;
+  const shorts = ASSET_ORDER.filter(s => STATE.sides[s] === "short" && STATE.weights[s] > 0.5);
+  const cash = cashPct();
 
   const strengths = [
-    `Diversificação entre setores: ${activeSyms.join(", ") || "—"} reagem a diferentes motores macro.`,
-    STATE.weights.GLD > 0.5 ? `Ouro (GLD, ${fmtNum(STATE.weights.GLD, 0)}%) tende a correlação mais baixa com os ativos de risco — ajuda a suavizar quedas concentradas em ações.` : null,
-    hasShort ? ASSET_ORDER.filter(s => STATE.sides[s] === "short" && STATE.weights[s] > 0.5).map(s => `A posição SHORT em ${s} tem contribuição ao risco de ${fmtPct(m.contrib[s], 1)} — ${m.contrib[s] < 0 ? "negativa, reduz o risco total da carteira (hedge)." : "ainda soma risco, monitorar."}`).join(" ") : null,
-    STATE.weights.CASH > 0.5 ? `Caixa de ${fmtNum(STATE.weights.CASH, 0)}% remunerado ao CDI (${fmtNum(RF * 100, 1)}% a.a.) dá um colchão de segurança e liquidez.` : null,
+    active.length > 1 ? `Diversificação entre setores: ${active.join(", ")} respondem a motores macro diferentes.` : null,
+    STATE.weights.GLD > 0.5 ? `Ouro (GLD, ${fmtNum(STATE.weights.GLD, 0)}%) tem correlação baixa com os ativos de risco — suaviza quedas concentradas em ações.` : null,
+    ...shorts.map(s => `Short em ${s}: contribuição ao risco de ${fmtPct(m.contrib[s], 1)} — ${m.contrib[s] < 0 ? "negativa, ou seja, reduz o risco total da carteira (hedge)." : "ainda soma risco, vale monitorar."}`),
+    cash > 0.5 ? `Caixa de ${fmtNum(cash, 1)}% (${fmtMoney(cashFrac() * m.capital)}) remunerado ao CDI (${fmtNum(RF * 100, 1)}% a.a.) dá colchão e liquidez.` : null,
   ].filter(Boolean);
 
   const risks = [
-    biggestRiskPair ? `${biggestRiskPair.a} × ${biggestRiskPair.b}: correlação ${fmtNum(biggestRiskPair.v)}, responde por ${fmtPct(Math.abs(biggestRiskPair.contrib), 1)} do risco combinado — o maior par de risco na carteira atual.` : null,
-    mostVolatile ? `${mostVolatile} é a posição mais volátil no momento (${fmtNum(DATA.assets[mostVolatile].stats.latest_rolling_vol_pct, 1)}% anualizada) — maior sensibilidade a notícias específicas do setor.` : null,
-    hasShort ? `Posições short precisam de monitoramento ativo: um rally forte no ativo gera perda na posição, mesmo com o resto da carteira subindo.` : null,
-    `Beta da carteira de ${fmtNum(m.beta)} ${isAggressive ? "acima de 1 — a carteira amplifica movimentos do mercado." : "abaixo de 1, mas concentração em poucas posições ainda pode reduzir a diversificação real."}`,
+    biggestPair && Math.abs(biggestPair.contrib) > 0.05
+      ? `${biggestPair.a} × ${biggestPair.b}: correlação ${fmtNum(biggestPair.v)}, responde por ${fmtPct(Math.abs(biggestPair.contrib), 1)} do risco combinado — o par mais pesado da carteira.` : null,
+    mostVolatile ? `${mostVolatile} é a posição mais volátil agora (${fmtNum(DATA.assets[mostVolatile].stats.latest_rolling_vol_pct, 1)}% anualizada) — mais sensível a notícias do setor.` : null,
+    shorts.length ? `Posições short exigem monitoramento ativo: um rally forte no ativo gera perda mesmo com o resto da carteira subindo.` : null,
+    `Beta de ${fmtNum(m.beta)} ${isAggressive ? "acima de 1 — a carteira amplifica os movimentos do mercado." : "abaixo de 1 — a carteira absorve menos que o mercado, mas concentração em poucas posições ainda limita a diversificação real."}`,
+    m.diversification < 35 ? `Diversificação de apenas ${fmtNum(m.diversification, 0)}%: o risco está concentrado em poucas posições.` : null,
   ].filter(Boolean);
-
-  const mk = window.MARKOWITZ_RESULT;
-  let mkLine = "";
-  if (mk) {
-    const sig = ASSET_ORDER.filter(s => mk.w[s] > 0.005).sort((a, b) => mk.w[b] - mk.w[a]);
-    const kScale = m.vol > 0 && mk.vol > 0 ? Math.min(1, m.vol / mk.vol) : 0;
-    const cashPct = 100 - kScale * 100;
-    const weightsStr = sig.map(s => `${s} ${(mk.w[s] * kScale * 100).toFixed(0)}%`).join(", ");
-    mkLine = `Se quer <strong>máximo Sharpe mantendo o risco atual</strong> (~${fmtNum(m.vol * 100, 1)}% de vol.): <strong>${weightsStr}, Cash ${cashPct.toFixed(0)}%</strong> (mix long-only entre as 5 posições — veja a seção 4; não simula shorts).`;
-  }
 
   document.getElementById("reco-card").innerHTML = `
     <h2>📊 Análise da carteira</h2>
-    <div class="reco-profile" style="background:${profileColor}; color:${profileTextColor}">Perfil: ${profileLabel} (beta ${fmtNum(m.beta)})</div>
+    <div class="reco-profile" style="background:${isAggressive ? "var(--critical-bg)" : "var(--good-bg)"}; color:${isAggressive ? "var(--critical-text)" : "var(--good-text)"}">Perfil: ${profileLabel} (beta ${fmtNum(m.beta)})</div>
     <div class="reco-cols">
-      <div class="reco-block">
-        <h4>Pontos fortes</h4>
-        <ul>${strengths.length ? strengths.map(s => `<li>${s}</li>`).join("") : "<li>Ajuste os pesos acima para ver a análise.</li>"}</ul>
-      </div>
-      <div class="reco-block">
-        <h4>Riscos</h4>
-        <ul>${risks.map(s => `<li>${s}</li>`).join("")}</ul>
-      </div>
+      <div class="reco-block"><h4>Pontos fortes</h4><ul>${strengths.length ? strengths.map(s => `<li>${s}</li>`).join("") : "<li>Defina pesos no painel acima para ver a análise.</li>"}</ul></div>
+      <div class="reco-block"><h4>Riscos</h4><ul>${risks.map(s => `<li>${s}</li>`).join("")}</ul></div>
     </div>
     <div class="reco-block">
       <h4>Comparação vs. benchmark</h4>
       <table class="reco-bench-table">
-        <tr><td>vs. S&amp;P 500 (CAPM)</td><td style="color:${m.alphaPct >= 0 ? "var(--good-text)" : "var(--critical-text)"}">${fmtPct(m.alphaPct)} alpha</td></tr>
-        <tr><td>Retorno esperado da carteira atual (anualizado)</td><td>${fmtPct(m.ret * 100)}</td></tr>
+        <tr><td>Alpha vs. S&amp;P 500 (CAPM)</td><td style="color:${m.alphaPct >= 0 ? "var(--good-text)" : "var(--critical-text)"}">${fmtPct(m.alphaPct)} a.a.</td></tr>
+        <tr><td>Retorno esperado da carteira (anualizado)</td><td>${fmtPct(m.ret * 100)}</td></tr>
+        <tr><td>Volatilidade · Sharpe</td><td>${fmtNum(m.vol * 100, 1)}% · ${fmtNum(m.sharpe)}</td></tr>
+        <tr><td>Perda esperada num dia ruim (VaR 95%)</td><td style="color:var(--critical-text)">-${fmtMoney(m.var95_1d_usd)}</td></tr>
       </table>
     </div>
-    ${mkLine ? `<div class="reco-mk">🏆 Sugestão Markowitz: ${mkLine}</div>` : ""}
-    <div class="reco-footnote">Análise gerada a partir de dados históricos e dos pesos definidos no painel acima — atualiza em tempo real. Não constitui recomendação de investimento. Retorno passado não garante retorno futuro.</div>
+    <div class="reco-footnote">Análise gerada a partir dos dados históricos e dos pesos definidos no painel acima — atualiza em tempo real. Não constitui recomendação de investimento. Retorno passado não garante retorno futuro.</div>
   `;
 }
 
-// --- Orchestration --------------------------------------------------------
+// --- Orchestration ------------------------------------------------------------
 
 function renderAll() {
   updateControlUI();
@@ -521,29 +561,33 @@ function renderAll() {
   renderRecommendation();
 }
 
-// --- Shell / init --------------------------------------------------------
-
 function renderShell() {
   const updated = new Date(DATA.generated_at_utc);
+  const ageMin = Math.round((Date.now() - updated.getTime()) / 60000);
+  const ageLabel = ageMin < 60 ? `há ${ageMin} min` : `há ${Math.round(ageMin / 60)} h`;
   document.getElementById("app-root").innerHTML = `
     <header class="top">
       <div>
         <h1>Carteira JGP</h1>
         <div class="sub">XLK · XLE · EWZ · XLY · GLD + caixa — dashboard interativo de risco e retorno</div>
       </div>
-      <div class="updated">Dados atualizados em<br><strong>${updated.toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" })} (UTC)</strong></div>
+      <div class="updated">Preços atualizados<br><strong>${updated.toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" })} UTC</strong><br><span class="age">${ageLabel}</span></div>
     </header>
     <div class="disclaimer-banner">⚠️ Ferramenta educacional/analítica. Todos os números vêm de dados históricos (Yahoo Finance) e não constituem recomendação de investimento — retorno passado não garante retorno futuro.</div>
 
-    <div class="section-title">Ajuste a carteira</div>
-    <div class="section-sub">Mude o peso e o lado (long/short) de cada posição — composição, correlação, performance, métricas e recomendação abaixo atualizam em tempo real.</div>
+    <div class="quotes-strip" id="quotes-strip"></div>
+
+    <div class="section-title">1 · Ajuste a carteira</div>
+    <div class="section-sub">Cada peso é independente — mexer em um não mexe nos outros. O caixa absorve a diferença para fechar 100%. Composição, correlação, performance, métricas e análise atualizam em tempo real.</div>
     <div class="control-panel">
       <div id="control-sliders"></div>
-      <div class="slider-total" id="control-total">Total: 100%</div>
-      <button type="button" class="reset-btn" id="reset-control-btn">↺ Restaurar carteira original</button>
+      <div class="control-footer">
+        <div class="slider-total" id="control-total"></div>
+        <button type="button" class="reset-btn" id="reset-control-btn">↺ Restaurar carteira original</button>
+      </div>
     </div>
 
-    <div class="section-title">1 · Composição da carteira</div>
+    <div class="section-title">2 · Composição da carteira</div>
     <div class="comp-grid">
       <div class="comp-pie-card"><div class="canvas-wrap"><canvas id="chart-composition"></canvas></div></div>
       <div class="comp-table-card">
@@ -553,81 +597,73 @@ function renderShell() {
         </table>
       </div>
     </div>
+    <h3 class="sub-heading">Ordens da carteira original</h3>
+    <div class="section-sub">Os lotes individuais por trás dos pesos acima. "Pendente" é o status técnico da ordem (PF = ordem com preço de disparo); as marcadas abaixo foram executadas na abertura. Esta tabela não muda com os sliders.</div>
+    <div class="orders-table-wrap">
+      <table class="orders-table">
+        <thead><tr><th>Ativo</th><th>Peso</th><th>Valor</th><th>Tipo</th><th>Preço disparo</th><th>Status</th></tr></thead>
+        <tbody id="orders-table-body"></tbody>
+      </table>
+    </div>
 
-    <div class="section-title">2 · Matriz de correlação</div>
+    <div class="section-title">3 · Matriz de correlação</div>
     <div class="corr-wrap">
       <div class="corr-scroll"><div id="corr-grid-host"></div></div>
       <div class="corr-scale"><span>-1 (inversa)</span><span class="bar"></span><span>+1 (junto)</span></div>
       <div class="info-card" id="corr-interp"></div>
     </div>
 
-    <div class="section-title">3 · Performance</div>
-    <div class="section-sub">A linha "Carteira" usa os pesos definidos no painel acima (short e caixa incluídos — caixa aproximado pela taxa CDI atual aplicada ao histórico todo).</div>
+    <div class="section-title">4 · Performance</div>
+    <div class="section-sub">A linha "Carteira" usa os pesos do painel acima (short e caixa incluídos; o caixa é aproximado pela taxa CDI atual aplicada a todo o histórico).</div>
     <div class="range-row" id="range-row"></div>
+    <div class="chart-card chart-wide">
+      <h3>Preço real (USD)</h3>
+      <div class="desc">Cotação de fechamento de cada ativo em dólares. Escala logarítmica para que ativos de preços muito diferentes (GLD ~$390 vs EWZ ~$38) sejam comparáveis no mesmo gráfico.</div>
+      <div class="canvas-wrap" style="height:300px"><canvas id="chart-price-usd"></canvas></div>
+    </div>
     <div class="charts-grid">
-      <div class="chart-card"><h3>Preço (indexado a 100)</h3><div class="desc">Evolução de cada posição e da carteira agregada</div><div class="canvas-wrap"><canvas id="chart-price"></canvas></div></div>
+      <div class="chart-card"><h3>Performance (indexada a 100)</h3><div class="desc">Mesma evolução em %, incluindo a carteira agregada</div><div class="canvas-wrap"><canvas id="chart-price-idx"></canvas></div></div>
       <div class="chart-card"><h3>Drawdown</h3><div class="desc">Queda percentual em relação ao topo do período</div><div class="canvas-wrap"><canvas id="chart-dd"></canvas></div></div>
       <div class="chart-card"><h3>Volatilidade rolante (21p, anualizada)</h3><div class="desc">Desvio-padrão dos retornos diários</div><div class="canvas-wrap"><canvas id="chart-vol"></canvas></div></div>
       <div class="chart-card"><h3>Sharpe rolante (63p, anualizado)</h3><div class="desc">Retorno/risco, rf = 0%</div><div class="canvas-wrap"><canvas id="chart-sharpe"></canvas></div></div>
     </div>
     <div class="chart-legend" id="perf-legend"></div>
 
-    <div class="section-title">4 · Medidas econométricas (Markowitz)</div>
-    <div class="section-sub">Simulador independente, long-only entre as 5 posições (fronteira e ótimo de Markowitz não simulam short nem caixa) — para explorar combinações teóricas, não a sua carteira atual do painel acima.</div>
-    <div class="sim-card">
-      <div id="sliders-host"></div>
-      <div class="slider-total" id="slider-total">Total: 100%</div>
-      <div class="sim-results" id="sim-results"></div>
-    </div>
-    <div class="chart-card" style="margin-top:16px">
-      <h3>Fronteira eficiente</h3>
-      <div class="desc">Cada ponto cinza é uma combinação de pesos possível (long-only); os pontos coloridos são os ativos isolados, sua simulação e o ótimo de Markowitz.</div>
-      <div class="canvas-wrap" style="height:340px"><canvas id="chart-frontier"></canvas></div>
-      <div class="legend-row" id="frontier-legend"></div>
-    </div>
-    <div class="section-title" style="margin-top:26px">Recomendação Markowitz</div>
-    <div class="markowitz-card" id="markowitz-card"></div>
-
     <div class="section-title">5 · CAPM (Capital Asset Pricing Model)</div>
-    <div class="section-sub">Beta e alpha de cada posição vs. S&amp;P 500 (^GSPC), últimos ${DATA.capm_window_days} pregões — não muda com os pesos, é uma propriedade de cada ativo.</div>
+    <div class="section-sub">Beta e alpha de cada posição vs. S&amp;P 500 (^GSPC), últimos ${DATA.capm_window_days} pregões — é propriedade de cada ativo, não muda com os pesos.</div>
     <div class="capm-table-wrap"><table class="capm-table" id="capm-table"></table></div>
-    <div class="chart-card"><h3>Beta por posição</h3><div class="desc">1.0 = mesma volatilidade do S&amp;P 500</div><div class="canvas-wrap" style="height:200px"><canvas id="chart-capm-beta"></canvas></div></div>
+    <div class="chart-card"><h3>Beta por posição</h3><div class="desc">1.0 = mesma sensibilidade do S&amp;P 500</div><div class="canvas-wrap" style="height:200px"><canvas id="chart-capm-beta"></canvas></div></div>
 
     <div class="section-title">6 · Métricas agregadas da carteira</div>
-    <div class="agg-note">Calculado a partir dos pesos definidos no painel "Ajuste a carteira" acima, janela de ${WINDOW} pregões, pesos assinados (short entra negativo).</div>
+    <div class="agg-note">Calculado a partir dos pesos do painel acima, janela de ${WINDOW} pregões, pesos assinados (short entra negativo).</div>
     <div class="stats-row" id="agg-stats"></div>
     <div class="chart-card">
       <h3>Contribuição ao risco por posição</h3>
-      <div class="desc">Decomposição de Euler da variância da carteira — valores negativos reduzem o risco total (hedge).</div>
+      <div class="desc">Decomposição de Euler da variância — valores negativos reduzem o risco total (hedge).</div>
       <table class="risk-contrib-table"><thead><tr><th>Posição</th><th>Contribuição ao risco</th></tr></thead><tbody id="risk-contrib-body"></tbody></table>
     </div>
 
-    <div class="section-title">7 · Recomendação e análise</div>
+    <div class="section-title">7 · Análise e recomendação</div>
     <div class="reco-card" id="reco-card"></div>
 
     <footer>
-      Fonte de preços: Yahoo Finance (fechamento diário, não ajustado por proventos). Benchmark CAPM: S&amp;P 500 (^GSPC). Taxa livre de risco: CDI anualizado (Banco Central, série SGS 12).
-      Seções 1, 2, 3 (linha "Carteira"), 6 e 7 recalculam ao vivo, no navegador, a partir dos pesos definidos no painel "Ajuste a carteira". Seção 4 é um simulador long-only independente. Seção 5 (CAPM) é por ativo e não depende dos pesos.
-      Dados de preço atualizados automaticamente via GitHub Actions. Esta página é uma ferramenta de análise histórica, não uma recomendação de investimento.
+      Fonte de preços: Yahoo Finance (fechamento diário e cotação intradiária, não ajustados por proventos). Benchmark CAPM: S&amp;P 500 (^GSPC). Taxa livre de risco: CDI anualizado (Banco Central, série SGS 12).
+      Os preços são atualizados automaticamente a cada 15 minutos no horário de mercado via GitHub Actions, e cada F5 busca a versão mais recente — o navegador não consegue chamar o Yahoo diretamente (sem CORS).
+      Seções 2, 3, 4 (linha "Carteira"), 6 e 7 recalculam ao vivo no navegador a partir dos pesos definidos. Valores em dólar sobre um patrimônio de ${fmtMoney(DATA.portfolio.capital_usd)}; não há conversão de câmbio aplicada.
+      Ferramenta de análise histórica, não recomendação de investimento.
     </footer>
   `;
 }
 
 async function loadData() {
-  const bust = Date.now();
-  const res = await fetch(`data/portfolio_data.json?t=${bust}`, { cache: "no-store" });
+  const res = await fetch(`data/portfolio_data.json?t=${Date.now()}`, { cache: "no-store" });
   if (!res.ok) throw new Error("Falha ao carregar data/portfolio_data.json.");
   DATA = await res.json();
-  ASSET_NAME = Object.fromEntries(DATA.portfolio.positions.map(p => [p.symbol, p.name]));
 
   DEFAULT_STATE = { weights: {}, sides: {} };
   DATA.portfolio.positions.forEach(p => { DEFAULT_STATE.weights[p.symbol] = p.weight * 100; DEFAULT_STATE.sides[p.symbol] = p.side; });
-  DEFAULT_STATE.weights.CASH = DATA.portfolio.cash_weight * 100;
   STATE = { weights: { ...DEFAULT_STATE.weights }, sides: { ...DEFAULT_STATE.sides } };
 
-  // Precompute the common trading-date calendar and each asset's daily
-  // return-by-date map, used to rebuild the "Carteira" line for ANY weights
-  // without another server round-trip.
   let dates = DATA.assets[ASSET_ORDER[0]].dates;
   ASSET_ORDER.slice(1).forEach(sym => {
     const set = new Set(DATA.assets[sym].dates);
@@ -655,10 +691,12 @@ async function init() {
     return;
   }
   renderShell();
+  renderQuotes();
+  renderOrders();
   renderControlPanel();
   buildRangeButtons();
-  initMarkowitz(DATA);      // js/markowitz.js — its own long-only simulator, correlation math (CORR/COV/ANN_RETURN/RF), frontier
-  renderCapm(DATA);         // js/capm.js
+  initStats(DATA);      // js/stats.js — COV / CORR / ANN_RETURN / SIGMA / RF
+  renderCapm(DATA);     // js/capm.js
   renderAll();
 }
 
