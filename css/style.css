@@ -112,6 +112,37 @@ footer{
 }
 footer a{ color:var(--text-secondary); }
 
+/* --- Control panel ("Ajuste a carteira") --- */
+.control-panel{ background:var(--surface); border:1px solid var(--border-strong); border-radius:14px; padding:22px 24px; margin-bottom:8px; }
+.control-row{ margin-bottom:16px; }
+.control-row:last-of-type{ margin-bottom:18px; }
+.control-head{ display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+.control-head .name{ display:flex; align-items:center; gap:8px; font-size:0.86rem; font-weight:600; }
+.control-head .val{ margin-left:auto; font-weight:600; }
+.control-row input[type="range"]{
+  -webkit-appearance:none; width:100%; height:8px; border-radius:4px; background:var(--surface-2); outline:none; cursor:pointer;
+}
+.control-row input[type="range"]::-webkit-slider-thumb{
+  -webkit-appearance:none; width:18px; height:18px; border-radius:50%;
+  background:var(--slider-accent, var(--text-primary)); border:2px solid var(--bg); cursor:pointer;
+}
+.control-row input[type="range"]::-moz-range-thumb{
+  width:18px; height:18px; border-radius:50%; border:2px solid var(--bg);
+  background:var(--slider-accent, var(--text-primary)); cursor:pointer;
+}
+.side-toggle{
+  font-family:"IBM Plex Mono", monospace; font-size:0.66rem; font-weight:700; letter-spacing:.04em;
+  padding:3px 9px; border-radius:6px; border:1px solid var(--border-strong); cursor:pointer;
+}
+.side-toggle.long{ background:var(--good-bg); color:var(--good-text); border-color:transparent; }
+.side-toggle.short{ background:var(--critical-bg); color:var(--critical-text); border-color:transparent; }
+.reset-btn{
+  font-family:"IBM Plex Sans", sans-serif; font-size:0.78rem; font-weight:600; padding:8px 14px;
+  border-radius:8px; border:1px solid var(--border-strong); background:var(--surface-2); color:var(--text-secondary); cursor:pointer;
+}
+.reset-btn:hover{ color:var(--text-primary); border-color:var(--text-muted); }
+.corr-label-w{ display:block; font-size:0.6rem; font-weight:600; color:var(--text-muted); margin-top:1px; }
+
 /* --- Section 1: Composição --- */
 .comp-grid{ display:grid; grid-template-columns:340px 1fr; gap:22px; margin-bottom:8px; }
 @media (max-width:860px){ .comp-grid{ grid-template-columns:1fr; } }

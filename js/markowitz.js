@@ -172,51 +172,12 @@ function buildFrontierAndMarkowitz() {
 }
 
 // --- rendering ---------------------------------------------------------------
-
-function corrColor(v) {
-  const hexToRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
-  const rgbToStr = c => `rgb(${c[0]},${c[1]},${c[2]})`;
-  const lerp = (a, b, t) => a.map((v2, i) => Math.round(v2 + (b[i] - v2) * t));
-  const neg = hexToRgb((cssVar("--critical").trim() || "#F85149").replace("#", "#"));
-  const neu = hexToRgb("#1c2330");
-  const pos = hexToRgb(cssVar("--good").trim() || "#3FB950");
-  if (v >= 0) return rgbToStr(lerp(neu, pos, v));
-  return rgbToStr(lerp(neu, neg, -v));
-}
-
-function renderCorrelation() {
-  const order = ASSET_ORDER;
-  const cells = [`<div></div>`];
-  order.forEach(sym => cells.push(`<div class="corr-label">${sym}</div>`));
-  order.forEach((symRow, i) => {
-    cells.push(`<div class="corr-label">${symRow}</div>`);
-    order.forEach((symCol, j) => {
-      const v = CORR[i][j];
-      const textColor = Math.abs(v) > 0.55 ? "#0a0e14" : cssVar("--text-primary");
-      cells.push(`<div class="corr-cell" style="background:${corrColor(v)}; color:${textColor}">${v.toFixed(2)}</div>`);
-    });
-  });
-
-  const pairs = [];
-  for (let i = 0; i < order.length; i++) for (let j = i + 1; j < order.length; j++) pairs.push({ a: order[i], b: order[j], v: CORR[i][j] });
-  const avgCorr = mkMean(pairs.map(p => p.v));
-  const divGeral = Math.max(0, Math.min(100, (1 - avgCorr) * 100));
-  const byAbsDesc = [...pairs].sort((a, b) => Math.abs(b.v) - Math.abs(a.v));
-  const describePair = (p) => {
-    const level = Math.abs(p.v) >= 0.6 ? "alta" : Math.abs(p.v) >= 0.3 ? "moderada" : "baixa";
-    const sign = p.v >= 0 ? "positiva" : "negativa";
-    let note = p.v >= 0 ? "se diversificar, esse par soma pouco valor" : "correlação negativa: tende a compensar movimentos";
-    if (p.a === "XLY" || p.b === "XLY") note += " — lembrete: XLY é mantido SHORT na carteira real, então o efeito prático sobre o risco é o oposto do sinal mostrado aqui.";
-    return `<li><strong>${p.a} × ${p.b}</strong> correlação ${level} ${sign} (${fmtNum(p.v)}) — ${note}</li>`;
-  };
-
-  document.getElementById("corr-grid-host").innerHTML = `<div class="corr-grid">${cells.join("")}</div>`;
-  document.getElementById("corr-interp").innerHTML = `
-    <div class="info-title">📊 Interpretação</div>
-    <ul>${byAbsDesc.map(describePair).join("")}</ul>
-    <div class="div-score" style="margin-top:12px; padding-top:12px; border-top:1px solid var(--border);">Diversificação geral (correlação média entre os ${pairs.length} pares): <strong>${divGeral.toFixed(0)}%</strong></div>
-  `;
-}
+// NOTE: the correlation heatmap + interpretation panel (section 2 of the
+// page) are rendered by js/app.js's renderCorrelation() instead of here —
+// they need to be a function of the live "Ajuste a carteira" weights
+// (STATE), which only app.js owns. This file only computes CORR (and
+// exposes it as window.CORR_MATRIX) plus everything the section-4
+// long-only simulator/frontier/Markowitz card need.
 
 function updateSliderUI() {
   ASSET_ORDER.forEach(sym => {
@@ -368,7 +329,6 @@ function initMarkowitz(data) {
     </div>
   `).join("");
 
-  renderCorrelation();
   attachSliderHandlers();
   updateSliderUI();
   renderFrontierChart();

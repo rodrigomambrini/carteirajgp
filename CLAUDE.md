@@ -14,6 +14,67 @@ independent repo/site, not a page inside desafiojgp.
 **Live site:** https://rodrigomambrini.github.io/carteirajgp/ (once Pages is
 enabled — see below).
 
+## The dashboard is interactive — sections 1/2/3/6/7 recompute live in-browser
+
+There's a control panel ("Ajuste a carteira", right under the disclaimer
+banner) with a slider + long/short toggle for each of the 5 positions plus a
+cash slider. It owns `STATE = {weights, sides}` in `js/app.js`, initialized
+from `data/portfolio.json` via `DEFAULT_STATE` (also what the "Restaurar
+carteira original" button resets to). Dragging a slider re-normalizes the
+other 5 proportionally so the total stays 100% (`normalizeOthersOnDrag()`,
+same pattern as `js/markowitz.js`'s section-4 sliders). Every change calls
+`renderAll()`, which recomputes and re-renders:
+
+- **Section 1** (composição) — pie + table, straight from `STATE`.
+- **Section 2** (correlação) — the heatmap *values* don't change (they're
+  asset-intrinsic, from `window.CORR_MATRIX`, computed once over the full
+  loaded history), but the interpretation list below it is ranked by each
+  pair's actual **contribution to the current portfolio's variance**
+  (`2 * w_i * w_j * Cov_ij / total variance`, using signed weights) instead
+  of by raw `|correlation|` — this is what makes the correlation section
+  "match the weights," per Rodrigo's explicit request. The grid's row/column
+  labels also carry a live weight badge (`corr-label-w`).
+- **Section 3**'s "Carteira" line — rebuilt client-side by
+  `computeLivePortfolioSeries()` from each asset's full daily-return history
+  (`ASSET_RET_BY_DATE`, precomputed once at load) plus a **flat** daily cash
+  return derived from the current CDI (`DAILY_RF`). This is an approximation
+  of the original server-side version (which used the actual historical
+  daily CDI series) — acceptable for a live what-if tool, but don't confuse
+  it with a precise backtest. The 5 individual asset lines don't change with
+  weights (they're single-asset series) — only "Carteira" is recomputed.
+- **Section 6** (métricas agregadas) and **Section 7** (recomendação) —
+  `liveStats()` recomputes return/vol/Sharpe/beta/alpha/VaR/risk-contribution
+  from `STATE` every time, reusing `js/markowitz.js`'s `COV`/`ANN_RETURN`/`RF`
+  (the 63-trading-day window, `WINDOW` — see below) rather than a second
+  covariance calculation. `renderRecommendation()`'s strengths/risks/pair
+  callouts are generated from whatever `STATE` currently is, not fixed copy.
+
+**Section 4 (Markowitz/fronteira) is deliberately NOT wired to `STATE`.**
+It's `js/markowitz.js`'s own pre-existing long-only 5-slider simulator
+(equal-weight by default, unrelated to the real portfolio) — extending it to
+support shorts + cash would mean rebuilding the frontier/tangency-portfolio
+math for signed weights, which wasn't asked for and adds a lot of surface
+area for a "long-only" academic curiosity tool. If asked to unify the two
+control panels into one, that's the change to make — right now there are
+intentionally two independent sets of sliders on the page (the "Ajuste a
+carteira" panel drives 1/2/3/6/7; section 4's own sliders are self-contained)
+and the section-4 sub-header says so explicitly.
+
+**Window mismatch, on purpose:** `liveStats()` (sections 6/7) uses
+`js/markowitz.js`'s `WINDOW = 63` trading days for vol/covariance, while
+each asset's CAPM beta/alpha (section 5, and folded into `liveStats()`'s
+beta/alpha lines) comes from `data.assets[sym].capm`, computed server-side
+over `CAPM_WINDOW = 252` days. Combining a 63-day vol with a 252-day beta is
+a bit inconsistent, but matching real-world practice (beta is conventionally
+a longer-window number than short-term vol) — not a bug to "fix" by forcing
+one window everywhere. (This project used to also compute a *second*,
+static, 252-day-window `portfolio_metrics` server-side for section 6 — that
+was replaced by the live 63-day `liveStats()` when the interactive panel was
+added, so `data/portfolio_data.json`'s `portfolio_metrics` /
+`portfolio_series` fields are no longer read by the page; `fetch_and_compute.py`
+still writes them since removing them would be a bigger, riskier change for
+no real benefit — they're just inert now. Don't be surprised they're unused.)
+
 ## The short position is the whole point — don't lose it when editing
 
 XLY is held **short**, not long. Every place that matters, it's handled via
@@ -85,8 +146,8 @@ sections on purpose**, not a bug to unify.
 index.html              shell + section markup, loads Chart.js + the 3 JS files
 css/style.css            theme tokens, composition table, CAPM table, recommendation card
 css/markowitz.css        correlation heatmap, slider simulator, frontier legend, Markowitz card
-js/app.js                loads data/portfolio_data.json, renders sections 1/3/6/7, owns shared globals (ASSET_ORDER, ACCENT_VAR, fmt helpers, cssVar)
-js/markowitz.js          sections 2 (correlation) + 4 (simulator/frontier/Markowitz) — exposes window.CORR_MATRIX and window.MARKOWITZ_RESULT for app.js's recommendation section
+js/app.js                loads data/portfolio_data.json, owns STATE (the interactive "Ajuste a carteira" panel) and renders sections 1/2/3/6/7 live from it, owns shared globals (ASSET_ORDER, ACCENT_VAR, fmt helpers, cssVar)
+js/markowitz.js          computes CORR/COV/ANN_RETURN/RF/SIGMA (exposed as window.CORR_MATRIX / plain globals) and renders section 4's own independent long-only simulator/frontier/Markowitz card; exposes window.MARKOWITZ_RESULT for app.js's recommendation section
 js/capm.js               section 5 (CAPM table + beta bar chart) — pure rendering, math already done in Python
 data/portfolio.json      the ONLY place position weights/sides/capital live — edit this to rebalance
 data/portfolio_data.json regenerated by fetch_and_compute.py — don't hand-edit
