@@ -1,0 +1,13 @@
+{
+  "capital_usd": 1000000,
+  "benchmark_symbol": "^GSPC",
+  "benchmark_name": "S&P 500",
+  "positions": [
+    { "symbol": "XLK", "name": "Technology Select Sector SPDR Fund", "weight": 0.20, "side": "long" },
+    { "symbol": "XLE", "name": "Energy Select Sector SPDR Fund", "weight": 0.15, "side": "long" },
+    { "symbol": "EWZ", "name": "iShares MSCI Brazil ETF", "weight": 0.10, "side": "long" },
+    { "symbol": "XLY", "name": "Consumer Discretionary Select Sector SPDR Fund", "weight": 0.10, "side": "short" },
+    { "symbol": "GLD", "name": "SPDR Gold Shares", "weight": 0.10, "side": "long" }
+  ],
+  "cash_weight": 0.35
+}
